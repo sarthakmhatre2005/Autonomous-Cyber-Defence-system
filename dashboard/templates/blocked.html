@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Website Access Blocked | Cyber Defense System</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --danger: #ff4d4d;
+        --background: #0f172a;
+        --surface: rgba(30, 41, 59, 0.7);
+        --text: #f8fafc;
+        --text-dim: #94a3b8;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        font-family: "Inter", sans-serif;
+      }
+
+      body {
+        background-color: var(--background);
+        color: var(--text);
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-image:
+          radial-gradient(
+            circle at 20% 30%,
+            rgba(255, 77, 77, 0.1) 0%,
+            transparent 50%
+          ),
+          radial-gradient(
+            circle at 80% 70%,
+            rgba(30, 58, 138, 0.1) 0%,
+            transparent 50%
+          );
+      }
+
+      .container {
+        max-width: 600px;
+        width: 90%;
+        background: var(--surface);
+        backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 24px;
+        padding: 48px;
+        text-align: center;
+        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .icon-wrapper {
+        width: 80px;
+        height: 80px;
+        background: rgba(255, 77, 77, 0.1);
+        border-radius: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 32px;
+        border: 2px solid var(--danger);
+      }
+
+      .icon-wrapper svg {
+        width: 40px;
+        height: 40px;
+        color: var(--danger);
+      }
+
+      h1 {
+        font-size: 32px;
+        font-weight: 700;
+        margin-bottom: 20px;
+        letter-spacing: -0.02em;
+      }
+
+      p {
+        color: var(--text-dim);
+        line-height: 1.6;
+        margin-bottom: 32px;
+        font-size: 16px;
+      }
+
+      .reason-box {
+        background: rgba(15, 23, 42, 0.5);
+        border-radius: 16px;
+        padding: 24px;
+        margin-bottom: 32px;
+        border-left: 4px solid var(--danger);
+        text-align: left;
+      }
+
+      .reason-label {
+        font-size: 12px;
+        text-transform: uppercase;
+        font-weight: 700;
+        color: var(--danger);
+        margin-bottom: 8px;
+        display: block;
+      }
+
+      .reason-text {
+        font-size: 14px;
+        color: var(--text);
+      }
+
+      .actions {
+        display: flex;
+        gap: 16px;
+        justify-content: center;
+      }
+
+      .btn {
+        padding: 12px 24px;
+        border-radius: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+        text-decoration: none;
+        font-size: 14px;
+      }
+
+      .btn-primary {
+        background: var(--danger);
+        color: white;
+        border: none;
+      }
+
+      .btn-primary:hover {
+        filter: brightness(1.1);
+        transform: translateY(-1px);
+      }
+
+      .btn-secondary {
+        background: transparent;
+        color: var(--text);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      .btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.05);
+      }
+
+      .footer {
+        margin-top: 48px;
+        font-size: 12px;
+        color: var(--text-dim);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+
+      .telecom-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 100px;
+        font-weight: 600;
+        font-size: 11px;
+        color: #4ed9ff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="icon-wrapper">
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M12 15v2m0 0v2m0-2h2m-2 0h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2"
+          />
+        </svg>
+      </div>
+      <h1>ACCESS DENIED</h1>
+      <p>
+        This website has been identified as malicious by the
+        <b>AI Cyber Defense System</b>. Access is restricted to protect your
+        device and data.
+      </p>
+
+      <div class="reason-box">
+        <span class="reason-label">AI Threat Analysis</span>
+        <div class="reason-text">
+          {{ reason or "This URL show patterns typically associated with
+          phishing, malware distribution, or deceptive practices. Accessing this
+          site may compromise your credentials or introduce unauthorized
+          software to your system." }}
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-primary" onclick="window.history.back()">
+          Go Back Safely
+        </button>
+        <button class="btn btn-secondary">Report False Positive</button>
+      </div>
+
+      <div class="footer">
+        <span class="telecom-badge">SECURE GATEWAY ENFORCED</span>
+        <span>Managed by Cyber Defense Protocol</span>
+      </div>
+    </div>
+  </body>
+</html>

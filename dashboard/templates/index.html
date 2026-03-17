@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Autonomous Cyber Defense — Next-Gen IDS/IPS SOC</title>
+    <meta
+      name="description"
+      content="Real-time autonomous cyber defense platform with deep packet inspection, external IP scanning, threat scoring, and intelligent blocking."
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='css/styles.css') }}"
+    />
+  </head>
+  <body>
+    <!-- ═══ TOP BAR ══════════════════════════════════════════════════════════ -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="logo-icon">🛡</div>
+        <div class="logo-text">
+          <span class="logo-title">AUTONOMOUS CYBER DEFENSE</span>
+          <span class="logo-sub"
+            >Next-Gen IDS/IPS · Ethical Security Platform</span
+          >
+        </div>
+      </div>
+      <div class="topbar-center">
+        <div class="sys-status">
+          <span class="pulse-dot"></span>
+          <span id="system-status-text">LIVE MONITORING</span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="topbar-badge" id="badge-external">
+          <span class="badge-label">EXT IPs</span>
+          <span class="badge-value" id="ext-ip-count">0</span>
+        </div>
+        <div class="topbar-badge alert-badge" id="badge-threats">
+          <span class="badge-label">THREATS</span>
+          <span class="badge-value" id="threat-count">0</span>
+        </div>
+        <div class="topbar-badge blocked-badge" id="badge-blocked">
+          <span class="badge-label">BLOCKED</span>
+          <span class="badge-value" id="blocked-count">0</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- ═══ NAV TABS ══════════════════════════════════════════════════════════ -->
+    <nav class="tab-nav">
+      <button
+        class="tab-btn active"
+        data-tab="overview"
+        onclick="switchTab('overview', this)"
+      >
+        📊 Overview
+      </button>
+
+      <button
+        class="tab-btn"
+        data-tab="packets"
+        onclick="switchTab('packets', this)"
+      >
+        📡 Packets
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="dns"
+        onclick="switchTab('dns', this)"
+      >
+        🕸️ DNS Monitor
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="threats"
+        onclick="switchTab('threats', this)"
+      >
+        ⚠️ Threats
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="blocked"
+        onclick="switchTab('blocked', this)"
+      >
+        🚫 Blocked
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="forensics"
+        onclick="switchTab('forensics', this)"
+      >
+        🔬 Forensics
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="tools"
+        onclick="switchTab('tools', this)"
+      >
+        🛠 Tools
+      </button>
+      <button
+        class="tab-btn"
+        data-tab="honeypot"
+        onclick="switchTab('honeypot', this)"
+      >
+        🍯 Honeypot
+      </button>
+    </nav>
+
+    <main class="main-content">
+      <!-- ═══ TAB: OVERVIEW ════════════════════════════════════════════════════ -->
+      <section id="tab-overview" class="tab-content active">
+        <!-- KPI Row -->
+        <div class="kpi-row">
+          <div class="kpi-card">
+            <div class="kpi-icon">📦</div>
+            <div class="kpi-body">
+              <div class="kpi-value" id="kpi-total-packets">0</div>
+              <div class="kpi-label">Packets Captured</div>
+            </div>
+          </div>
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-icon">🌍</div>
+            <div class="kpi-body">
+              <div class="kpi-value" id="kpi-external-pkts">0</div>
+              <div class="kpi-label">External Packets</div>
+            </div>
+          </div>
+          <div class="kpi-card kpi-orange">
+            <div class="kpi-icon">🔎</div>
+            <div class="kpi-body">
+              <div class="kpi-value" id="kpi-unique-ips">0</div>
+              <div class="kpi-label">Unique IPs Seen</div>
+            </div>
+          </div>
+          <div class="kpi-card kpi-red">
+            <div class="kpi-icon">⚡</div>
+            <div class="kpi-body">
+              <div class="kpi-value" id="kpi-high-threats">0</div>
+              <div class="kpi-label">High Threat IPs</div>
+            </div>
+          </div>
+          <div class="kpi-card kpi-purple">
+            <div class="kpi-icon">🚫</div>
+            <div class="kpi-body">
+              <div class="kpi-value" id="kpi-blocked-total">0</div>
+              <div class="kpi-label">Total Blocked</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Network Throughput -->
+        <div class="row-2col">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>🌡 Network Throughput (Real-time)</h2>
+              <span class="panel-badge live-badge">LIVE</span>
+            </div>
+            <div class="throughput-bars">
+              <div class="thr-bar">
+                <div class="thr-label">↓ INBOUND</div>
+                <div class="thr-track">
+                  <div
+                    class="thr-fill thr-recv"
+                    id="thr-recv-bar"
+                    style="width: 0%"
+                  ></div>
+                </div>
+                <div class="thr-val" id="thr-recv-val">0 KB/s</div>
+              </div>
+              <div class="thr-bar">
+                <div class="thr-label">↑ OUTBOUND</div>
+                <div class="thr-track">
+                  <div
+                    class="thr-fill thr-sent"
+                    id="thr-sent-bar"
+                    style="width: 0%"
+                  ></div>
+                </div>
+                <div class="thr-val" id="thr-sent-val">0 KB/s</div>
+              </div>
+            </div>
+            <canvas id="throughput-chart" height="50"></canvas>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>📊 Severity Distribution</h2>
+            </div>
+            <canvas id="severity-chart" height="110"></canvas>
+          </div>
+        </div>
+
+        <!-- Live Events Feed -->
+        <div class="panel">
+          <div class="panel-header">
+            <h2>⚡ Live Events Feed</h2>
+            <span class="panel-badge live-badge">AUTO-REFRESH</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Source IP</th>
+                  <th>IP Type</th>
+                  <th>Event</th>
+                  <th>Severity</th>
+                  <th>Score</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="events-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+
+
+      <!-- ═══ TAB: PACKET CAPTURE ══════════════════════════════════════════════ -->
+      <section id="tab-packets" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>📡 Live Packet Capture Stream</h2>
+            <span class="panel-badge live-badge">DEEP PACKET INSPECTION</span>
+          </div>
+          <div class="table-scroll pkt-table-wrap">
+            <table class="data-table mono-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Src IP</th>
+                  <th>→ Dst IP</th>
+                  <th>Type</th>
+                  <th>Proto</th>
+                  <th>Src Port</th>
+                  <th>Dst Port</th>
+                  <th>Size</th>
+                  <th>Flags/Status</th>
+                  <th>Process</th>
+                </tr>
+              </thead>
+              <tbody id="packets-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="row-2col">
+          <div class="panel">
+            <div class="panel-header"><h2>📊 Protocol Distribution</h2></div>
+            <canvas id="protocol-chart" height="120"></canvas>
+          </div>
+          <div class="panel">
+            <div class="panel-header"><h2>🔢 Port Activity</h2></div>
+            <div id="port-activity" class="port-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: THREAT INTEL ════════════════════════════════════════════════ -->
+      <section id="tab-threats" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>⚠️ Top Threat IPs — Ranked by Score</h2>
+            <span class="panel-badge danger-badge">THREAT ENGINE ACTIVE</span>
+          </div>
+          <div id="threat-cards" class="threat-cards-grid"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🎯 Recent Network Alerts</h2>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>IP</th>
+                  <th>Type</th>
+                  <th>IP Type</th>
+                  <th>Score</th>
+                  <th>Severity</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody id="alerts-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: BLOCKED ENTITIES ════════════════════════════════════════════ -->
+      <section id="tab-blocked" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🚫 Blocked Entities — IPs, Domains, Processes</h2>
+            <span class="panel-badge danger-badge">ENFORCEMENT ACTIVE</span>
+          </div>
+          <div class="blocked-grid" id="blocked-cards-grid"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><h2>📋 Recent Actions Log</h2></div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Entity Type</th>
+                  <th>Entity Value</th>
+                  <th>Action</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="actions-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: FORENSICS ════════════════════════════════════════════════════ -->
+      </section>
+
+      <!-- ═══ TAB: FORENSICS ════════════════════════════════════════════════════ -->
+      <section id="tab-forensics" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🔬 Forensic Event Timeline</h2>
+            <span class="panel-badge">CHRONOLOGICAL</span>
+          </div>
+          <div id="forensic-timeline" class="timeline-wrapper"></div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: DNS MONITORING ══════════════════════════════════════════ -->
+      <section id="tab-dns" class="tab-content">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🕸️ DNS Activity & Domain Heuristics</h2>
+            <span class="panel-badge info-badge">REAL-TIME TRAFFIC</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Domain Name</th>
+                  <th>Requesting IP</th>
+                  <th>Process</th>
+                  <th>Threat Score</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="dns-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: HONEYPOT ══════════════════════════════════════════════ -->
+      <section id="tab-honeypot" class="tab-content">
+        <div class="kpi-row">
+            <div class="kpi-card kpi-orange">
+                <div class="kpi-icon">🍯</div>
+                <div class="kpi-body">
+                    <div class="kpi-value" id="kpi-honeypot-hits">0</div>
+                    <div class="kpi-label">Honeypot Decoy Hits</div>
+                </div>
+            </div>
+            <div class="kpi-card kpi-blue">
+                <div class="kpi-icon">🛡️</div>
+                <div class="kpi-body">
+                    <div class="kpi-value">Active</div>
+                    <div class="kpi-label">Honeypot Status</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🍯 Honeypot Interaction Monitor</h2>
+            <span class="panel-badge danger-badge">DECOY DEPLOYED</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Attacker IP</th>
+                  <th>Source Port</th>
+                  <th>Decoy Port</th>
+                  <th>Activity</th>
+                </tr>
+              </thead>
+              <tbody id="honeypot-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ TAB: TOOLS ════════════════════════════════════════════════════════ -->
+      <section id="tab-tools" class="tab-content">
+        <div class="row-2col">
+          <!-- Manual IP Unblock -->
+          <div class="panel">
+            <div class="panel-header"><h2>🔓 Manual IP Unblock</h2></div>
+            <div class="tool-form">
+              <input
+                type="text"
+                id="unblock-ip"
+                class="tool-input"
+                placeholder="Enter IP to unblock (e.g. 1.2.3.4)"
+              />
+              <button class="tool-btn btn-green" onclick="manualUnblock()">
+                ✅ Unblock IP
+              </button>
+            </div>
+            <div id="unblock-result" class="result-box"></div>
+          </div>
+
+          <!-- Whitelist Panel -->
+          <div class="panel">
+            <div class="panel-header"><h2>✅ Trusted Entities (Whitelist)</h2></div>
+            <div class="tool-form">
+              <select id="wl-type" class="tool-input" style="width: auto; max-width:120px;">
+                <option value="IP">IP Address</option>
+                <option value="PROCESS">Process</option>
+              </select>
+              <input
+                type="text"
+                id="wl-value"
+                class="tool-input"
+                placeholder="e.g. 192.168.1.50 or calc.exe"
+              />
+              <button class="tool-btn btn-green" onclick="addToWhitelist()">
+                ➕ Add
+              </button>
+            </div>
+            <div id="wl-result" class="result-box"></div>
+            <div class="table-scroll" style="margin-top: 1rem; max-height:150px;">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Value</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="whitelist-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Network Interfaces -->
+        <div class="panel">
+          <div class="panel-header"><h2>🔌 Network Interfaces</h2></div>
+          <div id="interfaces-grid" class="interfaces-grid"></div>
+        </div>
+
+        <!-- Scan Report -->
+        <div class="panel">
+          <div class="panel-header">
+            <h2>📋 Full Network Scan Report</h2>
+            <button class="panel-btn" onclick="refreshScanReport()">
+              🔄 Refresh
+            </button>
+          </div>
+          <div id="scan-report" class="scan-report-box"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ═══ NOTIFICATION TOAST ════════════════════════════════════════════════ -->
+    <div id="toast" class="toast"></div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+  </body>
+</html>
