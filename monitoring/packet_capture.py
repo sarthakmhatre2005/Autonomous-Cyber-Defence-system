@@ -56,6 +56,36 @@ def get_ip_type(ip_str):
     except ValueError:
         return "UNKNOWN"
 
+def get_all_local_ips():
+    """Returns a set of all local IP addresses active on this machine."""
+    ips = {"127.0.0.1", "::1", "localhost"}
+    try:
+        import psutil
+        for iface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET:
+                    ips.add(addr.address)
+    except:
+        pass
+    
+    # Try to add default gateway
+    try:
+        # On Windows, this is a bit tricky without extra libs, 
+        # but we can infer it from 'route print' or common patterns.
+        # Simple heuristic: if we know our IP and it's 192.168.x.y, 
+        # 192.168.x.1 is often the gateway.
+        for ip in list(ips):
+            if ip.startswith("192.168.") or ip.startswith("10."):
+                parts = ip.split('.')
+                gateway = f"{parts[0]}.{parts[1]}.{parts[2]}.1"
+                ips.add(gateway)
+    except:
+        pass
+    return ips
+
+# Global set of protected IPs
+PROTECTED_IPS = get_all_local_ips()
+
 # ─── Packet Storage (Ring Buffer) ─────────────────────────────────────────────
 
 class PacketStore:
@@ -140,19 +170,45 @@ class PacketStore:
 
     def get_external_ips(self):
         with self._lock:
+            # Avoid repeated lookups in loop
             return [ip for ip in self.ip_timestamps.keys() if get_ip_type(ip) == "EXTERNAL"]
 
 
 # Global packet store
 packet_store = PacketStore()
 
-# ─── Scapy Packet Handler ─────────────────────────────────────────────────────
+# ─── Process Correlation Map ──────────────────────────────────────────────────
+# (proto, src_ip, src_port, dst_ip, dst_port) -> (process_name, pid)
+_CONNECTION_PROCESS_MAP = {}
+_CONN_LOCK = threading.Lock()
+
+def update_process_map(conn_data):
+    """Updates the global connection-to-process mapping."""
+    with _CONN_LOCK:
+        # Keep map size bounded
+        if len(_CONNECTION_PROCESS_MAP) > 5000:
+            _CONNECTION_PROCESS_MAP.clear()
+        
+        # Add both directions
+        key1 = (conn_data['protocol'], conn_data['src_ip'], conn_data['src_port'], conn_data['dst_ip'], conn_data['dst_port'])
+        key2 = (conn_data['protocol'], conn_data['dst_ip'], conn_data['dst_port'], conn_data['src_ip'], conn_data['src_port'])
+        _CONNECTION_PROCESS_MAP[key1] = (conn_data.get('process'), conn_data.get('pid'))
+        _CONNECTION_PROCESS_MAP[key2] = (conn_data.get('process'), conn_data.get('pid'))
+
+def get_process_for_packet(proto, sip, sport, dip, dport):
+    """Looks up the process associated with a network 5-tuple."""
+    with _CONN_LOCK:
+        return _CONNECTION_PROCESS_MAP.get((proto, sip, sport, dip, dport), ("UNKNOWN", None))
 
 # Avoid repeated globals lookup for hot path
 _traffic_analyzer_cached = None
 
 def handle_packet(pkt):
-    """Process each captured packet and store metadata."""
+    """
+    ULTRA-LIGHTWEIGHT Handler: 
+    Extract minimal metadata and enqueue IMMEDIATELY.
+    All classification/DNS analysis moved to worker threads.
+    """
     global _traffic_analyzer_cached
     try:
         if not pkt.haslayer(IP):
@@ -162,74 +218,46 @@ def handle_packet(pkt):
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
 
-        # We care about INCOMING packets (dst is local) and OUTGOING (src is local)
-        # Focus on connections FROM external sources TO this machine
-        ip_type = get_ip_type(src_ip)
-
-        protocol = "OTHER"
-        dst_port = None
-        src_port = None
-        payload_size = 0
-        flags = None
-
+        # Minimal metadata for the queue
         meta = {
             "timestamp": time.time(),
-            "datetime": datetime.now().isoformat(),
             "src_ip": src_ip,
             "dst_ip": dst_ip,
-            "ip_type": ip_type,
-            "protocol": protocol,
-            "payload_size": 0,
+            "protocol": "OTHER",
+            "payload_size": ip_layer.len,
             "source": "scapy"
         }
 
+        # Pass protocol and ports for the worker to correlate with processes
         if pkt.haslayer(TCP):
-            protocol = "TCP"
-            dst_port = pkt[TCP].dport
-            src_port = pkt[TCP].sport
-            flags = str(pkt[TCP].flags)
+            meta["protocol"] = "TCP"
+            meta["dst_port"] = pkt[TCP].dport
+            meta["src_port"] = pkt[TCP].sport
+            meta["flags"] = str(pkt[TCP].flags)
         elif pkt.haslayer(UDP):
-            protocol = "UDP"
-            dst_port = pkt[UDP].dport
-            src_port = pkt[UDP].sport
-            # Detect QUIC
-            if dst_port == 443 or src_port == 443:
-                protocol = "QUIC"
+            meta["protocol"] = "UDP"
+            meta["dst_port"] = pkt[UDP].dport
+            meta["src_port"] = pkt[UDP].sport
         elif pkt.haslayer(ICMP):
-            protocol = "ICMP"
-        elif pkt.haslayer(DNS):
-            protocol = "DNS"
+            meta["protocol"] = "ICMP"
         
-        meta["protocol"] = protocol
-        meta["dst_port"] = dst_port
-        meta["src_port"] = src_port
-        meta["flags"] = flags
+        # New: Defer deep inspection (DNS) to worker
+        if pkt.haslayer(DNS):
+            meta["has_dns"] = True
+            if pkt.haslayer(DNSQR):
+                # Only pass the raw qname object, don't decode here (CPU expensive)
+                try: meta["_dns_raw_qname"] = pkt[DNSQR].qname 
+                except: pass
 
-        if pkt.haslayer(IP):
-            payload_size = pkt[IP].len
-        elif pkt.haslayer(IPv6):
-            payload_size = pkt[IPv6].plen
-        else:
-            payload_size = len(pkt)
-        
-        meta["payload_size"] = payload_size
-
-        # ─── NEW: DNS Analysis Metadata ─────────────────────────────────────
-        if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
-            query = pkt[DNSQR].qname.decode('utf-8').strip('.')
-            meta["dns_query"] = query
-
-        packet_store.add(meta)
-
-        # Forward to analysis layer asynchronously via queue
+        # Forward to analysis layer IMMEDIATELY
         if _traffic_analyzer_cached is None:
             from monitoring.traffic_analyzer import traffic_analyzer
             _traffic_analyzer_cached = traffic_analyzer
         
         _traffic_analyzer_cached.process_packet(meta)
 
-    except Exception as e:
-        pass  # Silent fail on malformed packets
+    except Exception:
+        pass  # Silent fail is better than crashing the capture thread
 
 
 def find_active_interface():
@@ -245,14 +273,36 @@ def find_active_interface():
                 if addr.family == socket.AF_INET and not addr.address.startswith("127."):
                     active_ips.add(addr.address)
                     
-        # 2. Match Scapy IFACES by IP
+        # 2. Get local IP and default gateway
+        local_ip = None
+        try:
+            # Simple way to get local IP used for internet
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except: pass
+
+        # 3. Match Scapy IFACES by IP
+        best_fallback = None
         for dev in IFACES.values():
+            if not dev.ip or dev.ip.startswith("127.") or dev.ip == "0.0.0.0":
+                continue
+            
+            # Perfect match: current local IP
+            if dev.ip == local_ip:
+                print(f"[PacketCapture] Found LOCAL interface: {dev.description} ({dev.ip})")
+                return dev
+            
+            # Good match: active IPs from psutil
             if dev.ip in active_ips:
-                # Prefer Wi-Fi or Ethernet in description
                 desc = dev.description.lower() if hasattr(dev, 'description') else ""
-                if "wi-fi" in desc or "wlan" in desc or "ethernet" in desc or "wireless" in desc:
-                    print(f"[PacketCapture] Found primary interface: {dev.description} ({dev.ip})")
-                    return dev
+                if any(x in desc for x in ["wi-fi", "wlan", "ethernet", "wireless", "gigabit", "realtek", "intel"]):
+                    best_fallback = dev
+        
+        if best_fallback:
+            print(f"[PacketCapture] Found active interface: {best_fallback.description} ({best_fallback.ip})")
+            return best_fallback
         
         # Fallback: first non-loopback with an IP
         for dev in IFACES.values():
@@ -267,18 +317,28 @@ def find_active_interface():
 def start_scapy_capture():
     """Start capturing packets using scapy."""
     iface = find_active_interface()
-    # Scapy-compatible filter: ignore loopback and focus on external traffic
-    # 'ip' captures both in/out, we exclude 127.0.0.1 specifically
-    bpffilter = "ip"
+    # Filter: capture all IP traffic, but EXCLUDE port 5000 (dashboard itself) to reduce noise.
+    # Exclude port 53 (DNS) if we want to focus on data, but let's keep it and just exclude 5000.
+    bpffilter = "ip and not port 5000"
     
-    print(f"[PacketCapture] Starting Scapy capture on: {iface or 'ALL Interfaces'}")
-    print(f"[PacketCapture] Filter: {bpffilter}")
-    
+    # If no specific interface found, use None to sniff on all active interfaces
+    if iface is None:
+        print("[PacketCapture] No specific active interface found. Sniffing on ALL interfaces.")
+    else:
+        print(f"[PacketCapture] Starting Scapy capture on: {iface.description if hasattr(iface, 'description') else iface}")
+
     try:
         # Optimization: use store=False to avoid memory bloat
+        # count=0 means infinity
         sniff(filter=bpffilter, prn=handle_packet, store=False, iface=iface, count=0)
     except Exception as e:
         print(f"[PacketCapture] Scapy capture error: {e}")
+        # Try one more time with iface=None as ultimate fallback
+        if iface is not None:
+            try:
+                print("[PacketCapture] Retrying on ALL interfaces...")
+                sniff(filter=bpffilter, prn=handle_packet, store=False, iface=None, count=0)
+            except: pass
 
 
 # ─── PSUtil Connection Monitor (Fallback + Supplement) ────────────────────────
@@ -323,6 +383,7 @@ class ConnectionMonitor:
                     self.known_connections.add(conn_key)
 
                     ip_type = get_ip_type(remote_ip)
+                    local_ip = conn.laddr.ip if conn.laddr else "127.0.0.1"
                     proc_name = "SYSTEM"
                     try:
                         if pid:
@@ -330,15 +391,26 @@ class ConnectionMonitor:
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
 
+                    # Update global process map for Scapy correlation
+                    update_process_map({
+                        'protocol': protocol,
+                        'src_ip': local_ip,
+                        'src_port': local_port,
+                        'dst_ip': remote_ip,
+                        'dst_port': remote_port,
+                        'process': proc_name,
+                        'pid': pid
+                    })
+
                     meta = {
                         "timestamp": time.time(),
                         "datetime": datetime.now().isoformat(),
-                        "src_ip": remote_ip,
-                        "dst_ip": "LOCAL",
+                        "src_ip": local_ip,
+                        "dst_ip": remote_ip,
                         "ip_type": ip_type,
                         "protocol": protocol,
-                        "src_port": remote_port,
-                        "dst_port": local_port,
+                        "src_port": local_port,
+                        "dst_port": remote_port,
                         "payload_size": 0,
                         "flags": status,
                         "ttl": 0,
@@ -371,13 +443,12 @@ connection_monitor = ConnectionMonitor()
 
 def start_connection_monitor():
     """Run psutil connection monitor in background loop."""
-    print("[PacketCapture] Starting psutil connection monitor...")
     while True:
         try:
             connection_monitor.scan_connections()
-        except Exception as e:
+        except Exception:
             pass
-        time.sleep(5)  # 5s is plenty for connection-level tracking; 2s was too heavy
+        time.sleep(2)
 
 
 # ─── Network Interface Stats ──────────────────────────────────────────────────

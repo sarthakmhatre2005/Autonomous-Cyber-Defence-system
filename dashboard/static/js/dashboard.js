@@ -28,8 +28,9 @@ function switchTab(tabId, btn) {
   if (tabId === 'threats') { fetchThreats(); fetchAlerts(); }
   if (tabId === 'dns') fetchDNSHistory();
   if (tabId === 'blocked') { fetchBlockedCards(); fetchActions(); }
-  if (tabId === 'network') fetchIPProfiles();
-  if (tabId === 'tools') { fetchInterfaces(); refreshScanReport(); fetchWhitelist(); }
+  if (tabId === 'network') { fetchIPProfiles(); fetchNetworkStats(); }
+
+  if (tabId === 'tools') { fetchInterfaces(); fetchWhitelist(); }
   if (tabId === 'honeypot') fetchHoneypotEvents();
 }
 
@@ -762,18 +763,7 @@ async function fetchInterfaces() {
   } catch(e) {}
 }
 
-async function refreshScanReport() {
-  const box = document.getElementById('scan-report');
-  if (!box) return;
-  box.textContent = 'Generating scan report...';
-  try {
-    const res = await fetch('/api/network/scan-report');
-    const d = await res.json();
-    box.textContent = JSON.stringify(d, null, 2);
-  } catch(e) {
-    box.textContent = 'Failed to fetch scan report.';
-  }
-}
+
 
 async function fetchAttackerProfiles() {
   try {

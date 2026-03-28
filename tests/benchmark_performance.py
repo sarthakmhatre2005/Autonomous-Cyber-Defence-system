@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import random
 import threading
@@ -50,4 +53,4 @@ def simulate_packets(n=5000):
     print(f"Recent Alerts: {stats['recent_alerts']}")
 
 if __name__ == "__main__":
-    simulate_packets(5000)
+    simulate_packets(50000)

@@ -12,6 +12,112 @@ import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
+# ─── Behavior + Pattern Intelligence (Lightweight) ─────────────────────────────
+
+class IPBehaviorProfile:
+    """
+    Lightweight per-IP behavior baseline + pattern memory.
+    Kept intentionally simple to avoid false positives and keep CPU low.
+    """
+
+    def __init__(self, ip: str):
+        self.ip = ip
+        self._lock = threading.Lock()
+
+        # Tracking
+        self.request_count = 0
+        self.last_seen = 0.0
+        self.ports = set()
+        self.connection_count = 0
+
+        # Baselines (simple moving averages)
+        self.avg_rate_10s = 0.0
+        self.avg_port_count_60s = 0.0
+
+        # Recent activity timing
+        self._seen_times = deque(maxlen=50)  # timestamps for burstiness
+
+        # Repetition memory (recent alert types, rolling window)
+        self._recent_alerts = deque(maxlen=30)  # (ts, alert_type)
+
+        # ML memory
+        self.last_ml_score = 0.0
+        self.last_ml_ts = 0.0
+
+    def update_from_profile(self, profile):
+        """Update behavior snapshot using TrafficAnalyzer IPProfile (if available)."""
+        now = time.time()
+        with self._lock:
+            self.request_count += 1
+            self.last_seen = now
+            self._seen_times.append(now)
+
+            if profile is None:
+                return
+
+            # Pull stats from existing profile (already optimized there)
+            try:
+                rate_10s = float(profile.get_packet_rate(window_sec=10))
+            except Exception:
+                rate_10s = 0.0
+            try:
+                port_count_60s = float(profile.get_recent_port_count(window_sec=60))
+            except Exception:
+                port_count_60s = 0.0
+
+            # Simple moving averages (lightweight baseline learning)
+            self.avg_rate_10s = (self.avg_rate_10s + rate_10s) / 2.0 if self.avg_rate_10s else rate_10s
+            self.avg_port_count_60s = (self.avg_port_count_60s + port_count_60s) / 2.0 if self.avg_port_count_60s else port_count_60s
+
+            # Best-effort ports/connection count (not required for decision)
+            try:
+                self.connection_count = int(getattr(profile, "connection_count", self.connection_count))
+            except Exception:
+                pass
+            try:
+                ports = profile.get_distinct_ports(window_sec=60)
+                if ports:
+                    # Keep only a small rolling set (avoid unbounded growth)
+                    if len(self.ports) > 2000:
+                        self.ports.clear()
+                    self.ports.update(set(list(ports)[:200]))
+            except Exception:
+                pass
+
+    def record_alert(self, alert_type: str, alert: dict):
+        now = float(alert.get("timestamp", time.time()))
+        with self._lock:
+            self._recent_alerts.append((now, alert_type))
+            if alert_type == "ML_ANOMALY":
+                # In your pipeline, alert["score"] is an int derived from MLDetector threat_delta.
+                try:
+                    self.last_ml_score = float(alert.get("score", 0.0))
+                except Exception:
+                    self.last_ml_score = 0.0
+                self.last_ml_ts = now
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "request_count": self.request_count,
+                "last_seen": self.last_seen,
+                "ports_count": len(self.ports),
+                "connection_count": self.connection_count,
+                "avg_rate_10s": self.avg_rate_10s,
+                "avg_port_count_60s": self.avg_port_count_60s,
+                "last_ml_score": self.last_ml_score,
+                "last_ml_ts": self.last_ml_ts,
+                "seen_times": list(self._seen_times),
+                "recent_alerts": list(self._recent_alerts),
+            }
+
+
+def _clamp01(x: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(x)))
+    except Exception:
+        return 0.0
+
 # ─── Score Weights ─────────────────────────────────────────────────────────────
 
 SCORE_WEIGHTS = {
@@ -62,6 +168,8 @@ class IPThreatState:
         self.blocked_at = None
         self.is_blocked = False
         self.block_reason = ""
+        self.last_confidence = 0.0
+        self.last_reasoning = ""
         self._lock = threading.Lock()
 
     def add_score(self, points, reason, alert_type):
@@ -103,6 +211,8 @@ class IPThreatState:
                 "threat_level": self.get_threat_level(),
                 "action": self.action,
                 "is_blocked": self.is_blocked,
+                "confidence": round(self.last_confidence, 2),
+                "reasoning": self.last_reasoning[:400],
                 "evidence_count": len(self.evidence),
                 "evidence": list(self.evidence)[-5:],  # Last 5 pieces
                 "last_updated": datetime.fromtimestamp(self.last_updated).isoformat(),
@@ -126,6 +236,8 @@ class ThreatScoringEngine:
         self._blocked_ips = set()
         self._event_timeline = deque(maxlen=1000)  # Forensic timeline
         self._action_log = deque(maxlen=500)
+        self._behavior = {}   # ip -> IPBehaviorProfile
+        self._domain_repeats = defaultdict(lambda: deque(maxlen=50))  # domain -> [timestamps]
 
         # Start auto-unblock monitor
         t = threading.Thread(target=self._unblock_monitor, daemon=True)
@@ -136,6 +248,99 @@ class ThreatScoringEngine:
             if ip not in self._states:
                 self._states[ip] = IPThreatState(ip)
             return self._states[ip]
+
+    def _get_behavior(self, ip: str) -> IPBehaviorProfile:
+        with self._lock:
+            b = self._behavior.get(ip)
+            if b is None:
+                b = IPBehaviorProfile(ip)
+                self._behavior[ip] = b
+            return b
+
+    def _detect_patterns(self, ip: str, behavior_snap: dict, profile, alert: dict) -> list:
+        """
+        Pattern detection using behavior snapshot + current TrafficAnalyzer profile.
+        Returns a list of human-readable pattern strings.
+        """
+        patterns = []
+        now = time.time()
+
+        # Current observed stats (best-effort)
+        cur_rate = 0.0
+        cur_ports = 0.0
+        try:
+            if profile is not None:
+                cur_rate = float(profile.get_packet_rate(window_sec=10))
+                cur_ports = float(profile.get_recent_port_count(window_sec=60))
+        except Exception:
+            pass
+
+        avg_rate = float(behavior_snap.get("avg_rate_10s") or 0.0)
+        avg_ports = float(behavior_snap.get("avg_port_count_60s") or 0.0)
+
+        # 1) Sudden spike in requests (avoid blocking on a single spike)
+        # Trigger pattern only when rate is meaningfully above baseline and above a floor.
+        if avg_rate > 0.0:
+            if cur_rate >= max(6.0, avg_rate * 3.0):
+                patterns.append(f"abnormal spike: {cur_rate:.1f} pkt/s vs baseline {avg_rate:.1f} pkt/s")
+        else:
+            if cur_rate >= 25.0:
+                patterns.append(f"abnormal spike: {cur_rate:.1f} pkt/s (no baseline yet)")
+
+        # 2) Multiple ports rapidly (port-scan-like behavior)
+        if avg_ports > 0.0:
+            if cur_ports >= max(10.0, avg_ports * 3.0):
+                patterns.append(f"rapid multi-port access: {int(cur_ports)} ports/60s vs baseline {avg_ports:.1f}")
+        else:
+            if cur_ports >= 15.0:
+                patterns.append(f"rapid multi-port access: {int(cur_ports)} ports/60s (no baseline yet)")
+
+        # 3) Repeated login attempts (brute force)
+        # TrafficAnalyzer already emits BRUTE_FORCE; we also detect repetition from evidence here.
+        alert_type = alert.get("type", "UNKNOWN")
+        if alert_type == "BRUTE_FORCE":
+            patterns.append("repeated login attempts (brute force signal)")
+
+        # 4) Unusual activity timing (burst vs normal)
+        seen = behavior_snap.get("seen_times") or []
+        if len(seen) >= 8:
+            # If many packets arrive in a very tight window, mark bursty
+            try:
+                window = float(seen[-1]) - float(seen[-8])
+                if window >= 0.0 and window <= 1.0:
+                    patterns.append("bursty timing: 8+ events within ~1s")
+            except Exception:
+                pass
+
+        return patterns
+
+    def _count_repeats(self, behavior_snap: dict, alert_types: set, window_sec: float = 60.0) -> int:
+        """Count how often any of alert_types occurred in recent window."""
+        now = time.time()
+        recent = behavior_snap.get("recent_alerts") or []
+        c = 0
+        for ts, t in recent:
+            try:
+                if now - float(ts) <= window_sec and t in alert_types:
+                    c += 1
+            except Exception:
+                continue
+        return c
+
+    def _compute_confidence(self, *, ml_score: float, rate_deviation: float, repetition: int) -> float:
+        """
+        Confidence in maliciousness: combine ML + deviation + repetition.
+        Returned value in [0,1].
+        Safety-biased: repetition is required to get high confidence.
+        """
+        # Normalize ML score: in your pipeline it is int-ish (0..~10+)
+        ml_norm = _clamp01(ml_score / 10.0)
+        dev_norm = _clamp01(rate_deviation)  # already a 0..1 measure
+        rep_norm = _clamp01(repetition / 5.0)
+
+        # Weight repetition heavily to avoid blocking on one-off anomalies/spikes
+        confidence = (0.35 * ml_norm) + (0.25 * dev_norm) + (0.40 * rep_norm)
+        return _clamp01(confidence)
 
     def process_alert(self, alert, profile=None):
         """
@@ -154,13 +359,15 @@ class ThreatScoringEngine:
         state = self._get_state(ip)
         state.add_score(score_delta, detail, alert_type)
 
-        # Trigger Active Recon if score is becoming significant
-        if state.score >= 5 and ip != "GLOBAL_NETWORK":
-            try:
-                from nmap_integration import nmap_recon
-                nmap_recon.trigger_scan(ip)
-            except:
-                pass
+        # Update per-IP behavior profile (baseline learning)
+        behavior = self._get_behavior(ip)
+        behavior.update_from_profile(profile)
+        behavior.record_alert(alert_type, alert)
+
+        # Trigger Active Recon Logic - (Currently Disabled to Reduce Complexity/Remove Unnecessary Files)
+        # To enable, create nmap_integration.py and uncomment below
+        # if state.score >= 5 and ip != "GLOBAL_NETWORK":
+        #     pass
 
         # Record in forensic timeline
         self._event_timeline.append({
@@ -195,7 +402,7 @@ class ThreatScoringEngine:
             })
 
         # Determine action based on accumulated score
-        action = self._decide_action(ip, state, alert)
+        action = self._decide_action(ip, state, alert, profile=profile, behavior=behavior)
 
         # Log to database
         try:
@@ -225,19 +432,32 @@ class ThreatScoringEngine:
         if alert_type == "DNS_THREAT":
             # Detail format: f"Suspicious Domain: {query} ({', '.join(reasons)})"
             domain = detail.split(": ")[1].split(" (")[0] if ": " in detail else ""
-            if domain and score_delta >= 6:
+
+            # Safety upgrade: NEVER block domain on a single hit.
+            # Only block when the domain repeats over time and score is high.
+            if domain:
+                now = time.time()
+                self._domain_repeats[domain].append(now)
+                # prune older than 10 minutes
+                while self._domain_repeats[domain] and now - self._domain_repeats[domain][0] > 600:
+                    self._domain_repeats[domain].popleft()
+
+            repeat_hits = len(self._domain_repeats.get(domain, [])) if domain else 0
+            should_block_domain = bool(domain and score_delta >= 7 and repeat_hits >= 3)
+
+            if should_block_domain:
                 try:
                     from defense.firewall import block_domain
                     block_domain(domain)
                     from data.database import block_entity_db, log_action
-                    block_entity_db("DOMAIN", domain, f"Suspicious domain detected: {detail}")
-                    log_action("DOMAIN", domain, "BLOCK", f"Heuristic Score {score_delta}")
+                    block_entity_db("DOMAIN", domain, f"High-confidence suspicious domain (repeat_hits={repeat_hits}): {detail}")
+                    log_action("DOMAIN", domain, "BLOCK", f"DNS score={score_delta}, repeat_hits={repeat_hits}")
                 except:
                     pass
 
         return action
 
-    def _decide_action(self, ip, state, alert):
+    def _decide_action(self, ip, state, alert, profile=None, behavior=None):
         """
         Smart decision engine:
         - score 0–3: MONITOR
@@ -255,13 +475,91 @@ class ThreatScoringEngine:
 
         action = "MONITOR"
 
-        if score >= 11 and evidence_count >= 3:
+        # ─── Behavior + pattern based intelligence (safety-biased) ───
+        behavior_snap = behavior.snapshot() if behavior is not None else {}
+        patterns = self._detect_patterns(ip, behavior_snap, profile, alert)
+
+        # "Repeated malicious pattern" requirement: count repeats of strong signals in last 60s
+        repeat_strong = self._count_repeats(
+            behavior_snap,
+            alert_types={"PORT_SCAN", "CONNECTION_BURST", "BRUTE_FORCE", "HIGH_RISK_PORT", "ML_ANOMALY", "HONEYPOT_HIT"},
+            window_sec=60.0
+        )
+
+        # Recent ML anomaly requirement (single anomaly alone must NOT block)
+        now = time.time()
+        last_ml_ts = float(behavior_snap.get("last_ml_ts") or 0.0)
+        last_ml_score = float(behavior_snap.get("last_ml_score") or 0.0)
+        has_recent_ml = (now - last_ml_ts) <= 45.0 and last_ml_score >= 1.0
+
+        # Frequency deviation (0..1)
+        cur_rate = 0.0
+        try:
+            if profile is not None:
+                cur_rate = float(profile.get_packet_rate(window_sec=10))
+        except Exception:
+            pass
+        avg_rate = float(behavior_snap.get("avg_rate_10s") or 0.0)
+        if avg_rate > 0.0 and cur_rate > avg_rate:
+            freq_dev = _clamp01((cur_rate - avg_rate) / max(avg_rate, 1e-6))
+        else:
+            freq_dev = 0.0
+
+        confidence = self._compute_confidence(
+            ml_score=last_ml_score if has_recent_ml else 0.0,
+            rate_deviation=freq_dev,
+            repetition=repeat_strong
+        )
+
+        # Explainable reasoning (MANDATORY)
+        reasoning_lines = []
+        if has_recent_ml:
+            reasoning_lines.append(f"ML anomaly present: score={last_ml_score:.1f} (recent)")
+        if patterns:
+            reasoning_lines.extend([f"Pattern: {p}" for p in patterns])
+        if repeat_strong:
+            reasoning_lines.append(f"Repeated strong signals: {repeat_strong} events/60s")
+        reasoning_lines.append(f"Confidence={confidence:.2f} (safety-biased)")
+
+        # Persist last reasoning to state (for dashboard/API visibility)
+        try:
+            state.last_confidence = float(confidence)
+            state.last_reasoning = " | ".join(reasoning_lines)
+        except Exception:
+            pass
+
+        # Hard safety rules:
+        # - single anomaly => never block
+        # - temporary spike => monitor/alert first (require repetition)
+        # - require ML + abnormal pattern + repetition + not whitelisted (whitelist enforced in _execute_block)
+        can_consider_block = (
+            has_recent_ml and
+            len(patterns) >= 1 and
+            repeat_strong >= 2 and
+            evidence_count >= 3
+        )
+
+        if score >= 11 and evidence_count >= 3 and can_consider_block and confidence >= 0.80:
             action = "BLOCK"
-            self._execute_block(ip, state, f"Score {score} - {state.evidence[-1]['type'] if state.evidence else 'multiple alerts'}", permanent=True)
+            reason = "Blocked because:\n- " + "\n- ".join(reasoning_lines)
+            self._execute_block(ip, state, reason, permanent=True)
 
         elif score >= 7 and evidence_count >= 2:
             action = "TEMP_BLOCK"
-            self._execute_block(ip, state, f"Score {score} - Suspicious pattern detected", permanent=False)
+            # TEMP_BLOCK is still a block; keep it ultra-safe (prefer ALERT/LOG unless very confident)
+            if can_consider_block and confidence >= 0.85:
+                reason = "Temp-blocked because:\n- " + "\n- ".join(reasoning_lines)
+                self._execute_block(ip, state, reason, permanent=False)
+            else:
+                action = "LOG"
+                state.action = action
+                self._action_log.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "ip": ip,
+                    "action": action,
+                    "score": score,
+                    "reason": "Alerted/Logged because (safe mode): " + " | ".join(reasoning_lines[:4]),
+                })
 
         elif score >= 4:
             action = "LOG"
@@ -271,7 +569,7 @@ class ThreatScoringEngine:
                 "ip": ip,
                 "action": action,
                 "score": score,
-                "reason": f"Suspicious activity (score={score})"
+                "reason": "Suspicious activity: " + " | ".join(reasoning_lines[:4]),
             })
 
         elif score == 0:
@@ -291,8 +589,9 @@ class ThreatScoringEngine:
         except Exception:
             pass
 
-        # Safety: never block localhost
-        if ip in {"127.0.0.1", "::1", "localhost"}:
+        # Safety: never block local/protected interface IPs
+        from monitoring.packet_capture import PROTECTED_IPS
+        if ip in PROTECTED_IPS:
             return
 
         if state.is_blocked:

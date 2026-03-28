@@ -38,8 +38,8 @@
       </div>
       <div class="topbar-right">
         <div class="topbar-badge" id="badge-external">
-          <span class="badge-label">EXT IPs</span>
-          <span class="badge-value" id="ext-ip-count">0</span>
+          <span class="badge-label"> Unique IPs</span>
+          <span class="badge-value" id="ext-ip-count">0</span>  
         </div>
         <div class="topbar-badge alert-badge" id="badge-threats">
           <span class="badge-label">THREATS</span>
@@ -97,6 +97,7 @@
       >
         🔬 Forensics
       </button>
+
       <button
         class="tab-btn"
         data-tab="tools"
@@ -406,6 +407,8 @@
         </div>
       </section>
 
+
+
       <!-- ═══ TAB: TOOLS ════════════════════════════════════════════════════════ -->
       <section id="tab-tools" class="tab-content">
         <div class="row-2col">
@@ -466,16 +469,7 @@
           <div id="interfaces-grid" class="interfaces-grid"></div>
         </div>
 
-        <!-- Scan Report -->
-        <div class="panel">
-          <div class="panel-header">
-            <h2>📋 Full Network Scan Report</h2>
-            <button class="panel-btn" onclick="refreshScanReport()">
-              🔄 Refresh
-            </button>
-          </div>
-          <div id="scan-report" class="scan-report-box"></div>
-        </div>
+
       </section>
     </main>
 

@@ -125,9 +125,12 @@ def monitor_processes():
     Main background loop for Host monitoring.
     """
     print("[*] Starting Host Behavior Monitor...")
-    last_window_title = ""
     known_pids = set(p.pid for p in psutil.process_iter(['pid']))
+    last_process_scan = 0
     last_scan = 0
+    last_window_title = ""
+    # Cache for scores to avoid re-calculating too often
+    process_scores = {}
 
     while True:
         try:
@@ -145,64 +148,50 @@ def monitor_processes():
                 )
                 last_window_title = title
                 
-            # 2. New Process Detection
+            # 2. New Process Detection (Every 1s)
             current_pids = set()
+            should_scan_scores = (time.time() - last_process_scan > 5)
+            
             for proc in psutil.process_iter(['pid', 'name']):
                 pid = proc.pid
                 current_pids.add(pid)
                 
+                # Detect New Processes
                 if pid not in known_pids:
                     known_pids.add(pid)
                     try:
                         name = proc.name()
                         log_event(
-                            src_ip="127.0.0.1",
-                            dest_ip="LOCAL",
-                            protocol="SYSTEM",
-                            severity="LOW",
-                            anomaly_score=0.0,
-                            active_window=name,
+                            src_ip="127.0.0.1", dest_ip="LOCAL", protocol="SYSTEM",
+                            severity="LOW", anomaly_score=0.0, active_window=name,
                             details={"pid": pid, "type": "New Process"}
                         )
                         threading.Thread(target=track_process_connections, args=(pid, name), daemon=True).start()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
 
-                # 3. Malicious Activity Detection
-                try:
-                    score = get_process_score(proc)
-                    if score >= 6:
-                        p_name = proc.name()
-                        
-                        # NEW: Check Safety Whitelist
-                        from data.database import is_whitelisted
-                        if is_whitelisted("PROCESS", p_name):
-                            continue # Skip termination
-                            
-                        log_event(
-                            src_ip="127.0.0.1",
-                            dest_ip="LOCAL",
-                            protocol="SYSTEM",
-                            severity="HIGH",
-                            anomaly_score=score/10.0,
-                            active_window=p_name,
-                            details={"pid": pid, "score": score, "event": f"Process Kill: {p_name}"},
-                            threat_score=int(score)
-                        )
-                        proc.terminate() # Try graceful first
-                        time.sleep(0.5)
-                        if proc.is_running(): proc.kill()
-                        
-                        block_entity_db("PROCESS", p_name, f"Malicious behavior (score {score})")
-                        
-                        # Inform Threat Engine for IP correlation if process has connections
-                        try:
-                            for conn in proc.connections():
-                                if conn.raddr:
-                                    threat_engine.process_alert({"ip": conn.raddr.ip, "type": "MALICIOUS_PROCESS", "severity": "HIGH", "score": 5, "detail": f"Process {p_name} terminated while connected"})
-                        except: pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                # 3. Malicious Activity Detection (Every 5s to save CPU)
+                if should_scan_scores:
+                    try:
+                        score = get_process_score(proc)
+                        if score >= 6:
+                            p_name = proc.name()
+                            from data.database import is_whitelisted
+                            if is_whitelisted("PROCESS", p_name): continue
+                                
+                            log_event(
+                                src_ip="127.0.0.1", dest_ip="LOCAL", protocol="SYSTEM",
+                                severity="HIGH", anomaly_score=score/10.0, active_window=p_name,
+                                details={"pid": pid, "score": score, "event": f"Process Kill: {p_name}"},
+                                threat_score=int(score)
+                            )
+                            proc.terminate()
+                            block_entity_db("PROCESS", p_name, f"Malicious behavior (score {score})")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            
+            if should_scan_scores:
+                last_process_scan = time.time()
             
             known_pids = known_pids & current_pids
             

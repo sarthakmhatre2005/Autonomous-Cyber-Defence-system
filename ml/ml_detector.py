@@ -24,7 +24,7 @@ class MLDetector:
             n_estimators=n_estimators,
             contamination=contamination,
             random_state=42,
-            max_samples=256,    # limit samples per tree for speed
+            max_samples="auto", # auto adjusts to n_samples if < 256
             n_jobs=-1           # use all available CPU cores
         )
         self.is_trained = False
@@ -32,7 +32,7 @@ class MLDetector:
 
         # Inference cache: (payload_size, rate_bin, port_count, proto) -> score
         self._cache = {}
-        self._cache_max = 2048
+        self._cache_max = 5000 # Increased cache size
         self._lock = threading.Lock()
 
         # Training throttle — train at most once every 30 seconds
@@ -43,15 +43,8 @@ class MLDetector:
 
     _PROTO_MAP = {"TCP": 1, "UDP": 2, "ICMP": 3, "QUIC": 4, "OTHER": 0}
 
-    def _extract_features_raw(self, profile, meta) -> tuple:
+    def _extract_features_raw(self, packet_rate, port_count, payload, proto_val) -> tuple:
         """Return a hashable feature key (coarsened for cache effectiveness)."""
-        proto_val = self._PROTO_MAP.get(meta.get("protocol", "OTHER"), 0)
-
-        # Avoid acquiring IPProfile locks multiple times — read once
-        packet_rate = profile.get_packet_rate(window_sec=10)
-        port_count = len(profile.get_distinct_ports(window_sec=60))
-        payload = meta.get("payload_size", 0)
-
         # Coarsen values for cache hits (round to nearest bucket)
         payload_bin  = (payload >> 6)          # 64-byte buckets
         rate_bin     = int(packet_rate * 2)    # 0.5-unit buckets
@@ -68,7 +61,13 @@ class MLDetector:
         Returns an anomaly score >= 0.
         Higher = more anomalous. Thread-safe.
         """
-        key = self._extract_features_raw(profile, meta)
+        # Read profile stats once to minimize lock contention
+        packet_rate = profile.get_packet_rate(window_sec=10)
+        port_count = profile.get_recent_port_count(window_sec=60)
+        payload = meta.get("payload_size", 0)
+        proto_val = self._PROTO_MAP.get(meta.get("protocol", "OTHER"), 0)
+
+        key = self._extract_features_raw(packet_rate, port_count, payload, proto_val)
         features_arr = self._key_to_array(key)
 
         # Always record history for online training

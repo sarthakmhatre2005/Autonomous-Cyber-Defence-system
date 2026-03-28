@@ -8,10 +8,24 @@ from monitoring.packet_capture import start_packet_capture
 from defense.honeypot import start_honeypot
 from dashboard.app import app
 
+def is_admin():
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
+
 def main():
     print("=" * 60)
     print("Initializing Autonomous AI Cyber Response Engine...")
     print("=" * 60)
+
+    if not is_admin():
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("WARNING: SYSTEM NOT RUNNING AS ADMINISTRATOR")
+        print("Firewall blocking and Domain blocking will be DISABLED.")
+        print("Please restart the terminal/IDE as Administrator.")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
     
     # 1. Initialize SQLite Database
     init_db()

@@ -180,33 +180,9 @@ def api_unblock_ip(ip_addr):
     unblock_entity_db("IP", ip_addr)
     return jsonify({"success": success, "message": f"IP {ip_addr} unblocked"})
 
-@app.route('/api/network/scan-report')
-def api_scan_report():
-    """Summary scan report: all IPs, classifications, threats."""
-    from monitoring.packet_capture import packet_store
-    all_ips = packet_store.get_all_ips()
-    report = {
-        "total_ips_seen": len(all_ips),
-        "external_ips": [],
-        "internal_ips": [],
-        "loopback_ips": [],
-        "threat_summary": threat_engine.get_stats(),
-    }
-    for ip in all_ips:
-        ip_type = get_ip_type(ip)
-        entry = {
-            "ip": ip,
-            "ip_type": ip_type,
-            "port_count": len(packet_store.get_ip_ports(ip)),
-            "packet_rate": round(packet_store.get_ip_rate(ip), 2),
-        }
-        if ip_type == "EXTERNAL":
-            report["external_ips"].append(entry)
-        elif ip_type == "INTERNAL":
-            report["internal_ips"].append(entry)
-        else:
-            report["loopback_ips"].append(entry)
-    return jsonify(report)
+
+
+
 
 
 @app.route('/api/intelligence/dns-history')

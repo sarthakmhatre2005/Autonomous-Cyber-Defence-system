@@ -875,6 +875,77 @@ body::before {
   background: rgba(255, 255, 255, 0.01);
 }
 
+
+
+/* ─── Action Components ───────────────────────────────────────────────────────── */
+.tool-form {
+  display: flex;
+  gap: 10px;
+  padding: 1.25rem;
+  background: rgba(0,0,0,0.1);
+  border-bottom: 1px solid var(--border);
+}
+
+.tool-input {
+  flex: 1;
+  background: var(--bg-void);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  transition: border-color 0.2s;
+}
+
+.tool-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 8px rgba(61, 139, 255, 0.2);
+}
+
+.tool-btn {
+  padding: 8px 20px;
+  border-radius: var(--radius-sm);
+  border: none;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 0.8rem;
+}
+
+.btn-blue {
+  background: var(--accent-blue);
+  color: white;
+}
+.btn-blue:hover {
+  background: #2a7aff;
+  box-shadow: 0 0 15px rgba(61, 139, 255, 0.4);
+}
+
+.btn-green {
+  background: var(--accent-green);
+  color: var(--bg-void);
+}
+.btn-green:hover {
+  background: #00d48a;
+}
+
+.btn-red {
+  background: var(--accent-red);
+  color: white;
+}
+.btn-red:hover {
+  background: #e60000;
+}
+
+
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .tl-time {
   color: var(--text-muted);
   font-family: var(--font-mono);
