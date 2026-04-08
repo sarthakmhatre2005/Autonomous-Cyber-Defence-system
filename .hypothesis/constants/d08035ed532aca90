@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\monitoring\website_analyzer.py
+# hypothesis_version: 6.151.9
+
+[3.6, '-', '.', '.bid', '.cf', '.download', '.ga', '.gq', '.icu', '.in-addr.arpa', '.local', '.ml', '.mov', '.online', '.pw', '.review', '.tk', '.top', '.xyz', '.zip', 'Excessive length', 'IP address in domain', 'Suspicious TLD', '_tcp.', '_udp.', 'account', 'amazon.com', 'apple.com', 'auth', 'banking', 'billing', 'bing.com', 'botnet', 'c2', 'cnc', 'confirm', 'credential', 'crypto', 'exploit', 'facebook.com', 'gift', 'github.com', 'google.com', 'hacker', 'invoice', 'login', 'malicious', 'microsoft.com', 'official', 'password', 'pay', 'payload', 'secure', 'security', 'signin', 'support', 'twitter.com', 'unknown', 'update', 'validate', 'verify', 'virus', 'wallet']

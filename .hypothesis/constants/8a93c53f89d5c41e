@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\defense\firewall.py
+# hypothesis_version: 6.151.9
+
+['/etc/hosts', '127.0.0.1', '::1', 'BLOCK', 'DOMAIN', 'Windows', 'a', 'getuid', 'localhost', 'r', 'requires elevation', 'w']

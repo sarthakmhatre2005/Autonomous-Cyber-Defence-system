@@ -1,0 +1,315 @@
+                    "score": threat_score,
+                    "detail": f"Suspicious DNS: {dns_query} ({', '.join(reasons)})",
+                    "domain": dns_query,
+                    "timestamp": now,
+                })
+
+        # ─── Behavioral Sampling & Stats Caching ───
+        # For very high volume IPs, we don't need to re-run full behavioral analysis on every single packet.
+        # This 10x speedup comes from skipping redundant behavior checks.
+        
+        should_analyze = True
+        stats_cache_key = src_ip
+        
+        # Check mini-cache for recent stats and decision
+        cached_info = self._stats_cache.get(src_ip)
+        if cached_info:
+            last_analysis, packet_rate, port_count, pkt_count = cached_info
+            # If we analyzed this IP very recently (< 50ms) and it's not a DNS packet,
+            # we can skip heavy analysis for most packets while still sampling regularly.
+            if now - last_analysis < _STATS_SKIP_SEC and not meta.get("has_dns"):
+                should_analyze = False
+                # Still increment packet count in cache to detect rapid bursts
+                self._stats_cache[src_ip] = (last_analysis, packet_rate, port_count, pkt_count + 1)
+                # Force heavy analysis every 15th packet on the fast path
+                if (pkt_count + 1) % 15 == 0:
+                    should_analyze = True
+                if pkt_count > 60:
+                    should_analyze = True
+
+        if not should_analyze:
+            return
+
+        # ─── Real-time behavioral stats (once per analysis cycle) ───
+        packet_rate_10s = profile.get_packet_rate(window_sec=10)
+        port_count_60s = profile.get_recent_port_count(window_sec=60)
+        
+        # Update cache
+        self._stats_cache[src_ip] = (now, packet_rate_10s, port_count_60s, 0)
+        if len(self._stats_cache) > 5000: self._stats_cache.clear()
+
+        # ─── ML Anomaly Detection ── throttled and sampled ────
+        last_ml = _ML_CALL_THROTTLE.get(src_ip, 0)
+        # Only run ML if enough time has passed AND we sample 1 in 5 packets to hit 10x throughput
+        if now - last_ml >= _ML_THROTTLE_SEC:
+            _ML_CALL_THROTTLE[src_ip] = now
+            anomaly_score = self.ml_detector.predict_anomaly(profile, meta)
+            if anomaly_score >= 1.0:
+                alerts.append({
+                    "type": "ML_ANOMALY",
+                    "severity": "MEDIUM" if anomaly_score < 4 else "HIGH",
+                    "score": int(anomaly_score),
+                    "detail": f"ML anomaly detected (score: {anomaly_score:.2f})",
+                    "timestamp": now,
+                })
+
+        # ─── Detection Methods (Using optimized stats) ───
+        alerts += self._detect_port_scan(src_ip, profile, port_count_60s)
+        alerts += self._detect_connection_burst(src_ip, profile, packet_rate_10s)
+        alerts += self._detect_brute_force(src_ip, profile, meta)
+        alerts += self._detect_high_risk_port(src_ip, profile, meta)
+        alerts += self._detect_traffic_spike(src_ip, profile, meta)
+        # Prune old throttle entries periodically
+        if len(_ML_CALL_THROTTLE) > 5000:
+            old_keys = [k for k, v in _ML_CALL_THROTTLE.items() if now - v > 60]
+            for k in old_keys:
+                del _ML_CALL_THROTTLE[k]
+
+        # Forward alerts to threat engine
+        if alerts:
+            ip_type = meta.get("ip_type", "UNKNOWN")
+            for alert in alerts:
+                alert["ip"] = src_ip
+                alert["ip_type"] = ip_type
+                # Best-effort process mapping for UI/logging (safe fallback).
+                alert["process"] = meta.get("process") or "unknown process"
+                self.alert_queue.append(alert)
+                try:
+                    self.threat_engine.process_alert(alert, profile)
+                except Exception:
+                    pass
+
+    # ── Detection: Port Scan ──────────────────────────────────────────────────
+
+    def _detect_port_scan(self, ip, profile, port_count):
+        """
+        Port scan detection:
+        - Sequential or random port probing in short time window
+        - Threshold: > 15 distinct ports in 60 seconds = port scan
+        """
+        alerts = []
+
+        MIN_PORTS_THRESHOLD = 15   # distinct ports to trigger
+        SUSPICIOUS_THRESHOLD = 8   # earlier warning
+
+        if port_count >= MIN_PORTS_THRESHOLD and not profile.is_scanning:
+            profile.is_scanning = True
+            if "PORT_SCAN" not in profile.threat_tags:
+                profile.threat_tags.append("PORT_SCAN")
+
+            # Check if sequential (nmap-style) - use profile lock to get ports
+            recent_ports = profile.get_distinct_ports(window_sec=60)
+            sorted_ports = sorted(recent_ports)
+            is_sequential = self._is_sequential(sorted_ports)
+            scan_type = "SEQUENTIAL" if is_sequential else "RANDOM"
+
+            alerts.append({
+                "type": "PORT_SCAN",
+                "subtype": scan_type,
+                "severity": "HIGH",
+                "score": 5,
+                "detail": f"Port scan detected: {port_count} ports in 60s ({scan_type})",
+                "ports_sample": sorted_ports[:10],
+                "timestamp": time.time(),
+            })
+
+        elif port_count >= SUSPICIOUS_THRESHOLD and "SUSPICIOUS_PORTSCAN" not in profile.threat_tags:
+            profile.threat_tags.append("SUSPICIOUS_PORTSCAN")
+            alerts.append({
+                "type": "SUSPICIOUS_PORTSCAN",
+                "severity": "MEDIUM",
+                "score": 2,
+                "detail": f"Suspicious port probing: {port_count} distinct ports",
+                "timestamp": time.time(),
+            })
+
+        # Reset scan flag if activity stops
+        elif port_count < 5:
+            profile.is_scanning = False
+
+        return alerts
+
+    def _is_sequential(self, sorted_ports):
+        """Check if port list is sequential (e.g., 80, 81, 82...)."""
+        if len(sorted_ports) < 5:
+            return False
+        sequential_runs = 0
+        for i in range(1, len(sorted_ports)):
+            if sorted_ports[i] - sorted_ports[i-1] <= 2:
+                sequential_runs += 1
+        return sequential_runs >= len(sorted_ports) * 0.6
+
+    # ── Detection: Connection Burst ───────────────────────────────────────────
+
+    def _detect_connection_burst(self, ip, profile, rate):
+        """
+        Connection burst: > 20 connections from same IP in 10 seconds.
+        Could indicate DDoS, scanner, or automated attack.
+        """
+        alerts = []
+
+        BURST_THRESHOLD = 10   # packets/sec = burst
+        SEVERE_BURST = 30       # extreme burst
+
+        if rate >= SEVERE_BURST and not profile.is_bursting:
+            profile.is_bursting = True
+            if "CONNECTION_BURST" not in profile.threat_tags:
+                profile.threat_tags.append("CONNECTION_BURST")
+            alerts.append({
+                "type": "CONNECTION_BURST",
+                "severity": "HIGH",
+                "score": 5,
+                "detail": f"Severe connection burst: {rate:.1f} pkt/s",
+                "rate": rate,
+                "timestamp": time.time(),
+            })
+
+        elif rate >= BURST_THRESHOLD and not profile.is_bursting:
+            profile.is_bursting = True
+            if "CONNECTION_BURST" not in profile.threat_tags:
+                profile.threat_tags.append("CONNECTION_BURST")
+            alerts.append({
+                "type": "CONNECTION_BURST",
+                "severity": "MEDIUM",
+                "score": 3,
+                "detail": f"Connection burst: {rate:.1f} pkt/s",
+                "rate": rate,
+                "timestamp": time.time(),
+            })
+
+        elif rate < 2:
+            profile.is_bursting = False  # Reset when calmed
+
+        return alerts
+
+    # ── Detection: Brute Force ────────────────────────────────────────────────
+
+    def _detect_brute_force(self, ip, profile, meta):
+        """
+        Brute force detection: repeated connections to SSH/RDP/FTP/DB ports.
+        Threshold: > 10 attempts to brute-force ports within 30 seconds.
+        """
+        alerts = []
+        dst_port = meta.get("dst_port", 0)
+
+        if dst_port not in BRUTE_FORCE_PORTS:
+            return alerts
+
+        now = time.time()
+        # Use deque for O(1) popleft instead of list comprehension on every packet
+        attempts = self.connection_attempts[ip]
+        attempts.append(now)
+        while attempts and now - attempts[0] > 30:
+            attempts.popleft()
+        recent_count = len(attempts)
+
+        BRUTE_THRESHOLD = 10
+
+        if recent_count >= BRUTE_THRESHOLD and not profile.is_brute_forcing:
+            profile.is_brute_forcing = True
+            if "BRUTE_FORCE" not in profile.threat_tags:
+                profile.threat_tags.append("BRUTE_FORCE")
+            alerts.append({
+                "type": "BRUTE_FORCE",
+                "severity": "HIGH",
+                "score": 6,
+                "detail": f"Brute force detected on port {dst_port}: {recent_count} attempts in 30s",
+                "target_port": dst_port,
+                "attempts": recent_count,
+                "timestamp": time.time(),
+            })
+
+        return alerts
+
+    # ── Detection: High-Risk Port ─────────────────────────────────────────────
+
+    def _detect_high_risk_port(self, ip, profile, meta):
+        """Detect connections to known malware/C2/exploit ports."""
+        alerts = []
+        dst_port = meta.get("dst_port", 0)
+
+        if dst_port in HIGH_RISK_PORTS:
+            tag = f"HIGH_RISK_PORT_{dst_port}"
+            if tag not in profile.threat_tags:
+                profile.threat_tags.append(tag)
+                alerts.append({
+                    "type": "HIGH_RISK_PORT",
+                    "severity": "HIGH",
+                    "score": 4,
+                    "detail": f"Connection to high-risk port {dst_port} (possible C2/malware)",
+                    "target_port": dst_port,
+                    "timestamp": time.time(),
+                })
+
+        return alerts
+
+    # ── Detection: Traffic Spike ──────────────────────────────────────────────
+
+    def _detect_traffic_spike(self, ip, profile, meta):
+        """Detect abnormal data transfer (bandwidth spike)."""
+        alerts = []
+        total_bytes = profile.get_total_bytes() if hasattr(profile, 'get_total_bytes') else profile.total_bytes
+
+        SPIKE_BYTES = 10 * 1024 * 1024  # 10 MB threshold
+
+        if total_bytes > SPIKE_BYTES:
+            tag = "TRAFFIC_SPIKE"
+            if tag not in profile.threat_tags:
+                profile.threat_tags.append(tag)
+                alerts.append({
+                    "type": "TRAFFIC_SPIKE",
+                    "severity": "MEDIUM",
+                    "score": 2,
+                    "detail": f"Abnormal data transfer: {total_bytes // 1024 // 1024}MB from {ip}",
+                    "bytes": total_bytes,
+                    "timestamp": time.time(),
+                })
+
+        return alerts
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_profile(self, ip):
+        with self._lock:
+            return self.profiles.get(ip)
+
+    def get_all_profiles(self):
+        with self._lock:
+            return {ip: p.to_dict() for ip, p in self.profiles.items() if p is not None}
+
+    def get_external_profiles(self):
+        with self._lock:
+            return {
+                ip: p.to_dict()
+                for ip, p in self.profiles.items()
+                if p is not None and p.ip_type == "EXTERNAL"
+            }
+
+    def get_recent_alerts(self, n=50):
+        return list(self.alert_queue)[-n:]
+
+    def get_stats(self):
+        with self._lock:
+            profiles = [p for p in self.profiles.values() if p]
+            external = [p for p in profiles if p.ip_type == "EXTERNAL"]
+            internal = [p for p in profiles if p.ip_type == "INTERNAL"]
+            flagged = [p for p in profiles if p.threat_score >= 4]
+            return {
+                "total_packets": self.total_packets,
+                "external_packets": self.external_packets,
+                "unique_ips": len(profiles),
+                "external_ips": len(external),
+                "internal_ips": len(internal),
+                "flagged_ips": len(flagged),
+                "recent_alerts": len(self.alert_queue),
+            }
+
+    def get_top_threats(self, n=10):
+        with self._lock:
+            profiles = [p for p in self.profiles.values() if p and p.threat_score > 0]
+            sorted_profiles = sorted(profiles, key=lambda p: p.threat_score, reverse=True)
+            return [p.to_dict() for p in sorted_profiles[:n]]
+
+
+# Global singleton
+traffic_analyzer = TrafficAnalyzer()

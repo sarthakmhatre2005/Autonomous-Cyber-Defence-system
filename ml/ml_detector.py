@@ -24,8 +24,8 @@ class MLDetector:
             n_estimators=n_estimators,
             contamination=contamination,
             random_state=42,
-            max_samples="auto", # auto adjusts to n_samples if < 256
-            n_jobs=-1           # use all available CPU cores
+            max_samples="auto",  # auto adjusts to n_samples if < 256
+            n_jobs=1,  # single job: faster for tiny batch inference, less thread churn under load
         )
         self.is_trained = False
         self.feature_history = deque(maxlen=2000)
@@ -137,4 +137,4 @@ class MLDetector:
 
 
 # Global singleton
-ml_detector = MLDetector(n_estimators=50, contamination=0.05)
+ml_detector = MLDetector(n_estimators=32, contamination=0.05)

@@ -88,8 +88,41 @@ function tagsHTML(tags) {
   return tags.map(t => `<span class="tag-pill">${t}</span>`).join('');
 }
 
+function escHTML(s) {
+  const x = (s === undefined || s === null) ? '' : String(s);
+  return x.replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]));
+}
+
+function normalizeText(v, fallback = 'unknown') {
+  if (v === undefined || v === null) return fallback;
+  const s = String(v).trim();
+  if (!s || s.toLowerCase() === 'none' || s.toLowerCase() === 'null' || s.toLowerCase() === 'undefined') return fallback;
+  return s;
+}
+
+function looksLikeIpOrIpPort(v) {
+  const s = String(v || '').trim().toLowerCase();
+  if (!s) return false;
+  const ip4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+  const ip4Port = /^(?:\d{1,3}\.){3}\d{1,3}:\d+$/;
+  return ip4.test(s) || ip4Port.test(s);
+}
+
 function threatLevelColor(level) {
   return { NORMAL: '#00f5a0', SUSPICIOUS: '#ff9500', MALICIOUS: '#ff3d3d', CRITICAL: '#ff0000' }[level] || '#aaa';
+}
+
+function normalizeSourceTypeLabel(sourceType) {
+  const st = String(sourceType || '').toUpperCase();
+  if (st === 'SYSTEM') return 'SYSTEM ACTIVITY';
+  if (st === 'LOCAL DEVICE' || st === 'LOCAL_DEVICE') return 'LOCAL DEVICE ACTIVITY';
+  return 'EXTERNAL THREAT';
 }
 
 
@@ -259,16 +292,43 @@ async function fetchEvents() {
       const sev = (ev.severity || 'LOW').toUpperCase();
       if (counts[sev] !== undefined) counts[sev]++;
  
+      const alertEventMap = {
+        PORT_SCAN: 'Suspicious port scan',
+        SUSPICIOUS_PORTSCAN: 'Suspicious port probing',
+        CONNECTION_BURST: 'Suspicious connection burst',
+        BRUTE_FORCE: 'Suspicious brute-force login attempts',
+        HIGH_RISK_PORT: 'High-risk port activity',
+        DNS_THREAT: 'Suspicious DNS activity',
+        ML_ANOMALY: 'ML anomaly detected',
+        HONEYPOT_HIT: 'Honeypot interaction',
+        CORRELATION_BOOST: 'Correlated attack chain',
+        CORRELATION: 'Correlation signal'
+      };
+
       let eventName = (ev.protocol && ev.protocol !== '—') ? ev.protocol : 'HEURISTIC';
       let displayDetails = '';
       
       try {
         const d = typeof ev.details === 'string' ? JSON.parse(ev.details) : ev.details;
         
-        // Pick the best event name
-        eventName = ev.protocol || d.alert_type || d.type || 'SYSTEM';
-        if (eventName === 'SYSTEM' && (d.app || d.title || d.pid)) {
-            eventName = `PROC: ${d.app || d.title || d.pid}`;
+        const activeWindow = (ev.active_window && ev.active_window !== 'N/A') ? String(ev.active_window) : '';
+
+        // Pick the best event name (human-readable)
+        if (d && d.alert_type && alertEventMap[d.alert_type]) {
+          eventName = alertEventMap[d.alert_type];
+        } else if (d && d.alert_type) {
+          eventName = String(d.alert_type);
+        } else if (d && (d.event && String(d.event).length > 0)) {
+          eventName = String(d.event);
+        } else if (d && d.type === 'New Process' && (d.app || activeWindow)) {
+          const app = d.app || activeWindow;
+          eventName = `${app} started`;
+        } else if (d && (d.app || activeWindow)) {
+          eventName = String(d.app || activeWindow);
+        } else if (d && d.pid) {
+          eventName = `Process (pid ${d.pid})`;
+        } else {
+          eventName = ev.protocol || d.type || 'SYSTEM';
         }
         
         // Format details nicely
@@ -280,15 +340,26 @@ async function fetchEvents() {
                 .filter(([k,v]) => !['threat_score', 'threat_level', 'alert_type', 'action'].includes(k))
                 .map(([k,v]) => `${k}:${v}`).join(', ');
         }
+        // Append process context if present (best-effort for investigation)
+        if (d && d.process && typeof d.process === 'string' && d.process.trim().length > 0 && displayDetails && displayDetails.indexOf(d.process) === -1) {
+          displayDetails = `${displayDetails} | process: ${d.process}`;
+        }
+        if (d && d.source_label && displayDetails.indexOf('source:') === -1) {
+          displayDetails = `${displayDetails} | source: ${d.source_label}`;
+        }
+        if (d && d.attack_type && displayDetails.indexOf('attack:') === -1) {
+          displayDetails = `${displayDetails} | attack: ${d.attack_type}`;
+        }
         if (!displayDetails) displayDetails = ev.details || '';
       } catch(e) { displayDetails = ev.details || ''; }
  
-      const score = ev.anomaly_score ? (ev.anomaly_score * 10).toFixed(1) : '0';
+      const eventRisk = (typeof ev?.details?.risk_score === 'number') ? ev.details.risk_score : null;
+      const score = (eventRisk !== null) ? String(eventRisk) : (ev.anomaly_score ? (ev.anomaly_score * 10).toFixed(1) : '0');
  
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td style="font-family:var(--font-mono);color:var(--text-muted)">${ts}</td>
-        <td style="font-family:var(--font-mono);color:var(--accent-cyan)">${ev.source_ip}</td>
+        <td style="font-family:var(--font-mono);color:var(--accent-cyan)">${ev.src_ip || ev.source_ip || '—'}</td>
         <td>${ipTypeBadge(ev.active_window === 'EXTERNAL' ? 'EXTERNAL' : (ev.active_window === 'LOOPBACK' ? 'LOOPBACK' : 'INTERNAL'))}</td>
         <td style="color:var(--text-secondary);font-weight:500">${eventName} ${ev.dest_ip && ev.dest_ip !== 'LOCAL' ? '→ ' + ev.dest_ip : ''}</td>
         <td>${severityBadge(sev)}</td>
@@ -420,6 +491,7 @@ async function fetchPackets() {
     const portSet = new Set();
     const HIGH_RISK_PORTS = new Set([4444, 1234, 31337, 12345, 54321, 8080, 8443, 6666, 6667, 9001]);
 
+    const seenRows = new Set();
     data.slice().reverse().forEach(p => {
       const ts = p.datetime ? fmt(p.datetime) : '';
       const proto = p.protocol || 'OTHER';
@@ -433,6 +505,15 @@ async function fetchPackets() {
         : 'style="color:var(--text-muted)"';
 
       const protoColor = { TCP: '#3d8bff', UDP: '#b44bff', ICMP: '#ff9500', QUIC: '#00f5a0', OTHER: '#8fa8d0' }[proto] || '#8fa8d0';
+
+      // Collapse visual duplicates in packet table (same tuple/flags/size in same refresh payload).
+      const rowSig = [
+        p.src_ip || '', p.dst_ip || '', proto || '',
+        p.src_port || 0, p.dst_port || 0,
+        p.flags || '', p.payload_size || 0
+      ].join('|');
+      if (seenRows.has(rowSig)) return;
+      seenRows.add(rowSig);
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
@@ -492,19 +573,42 @@ async function fetchThreats() {
       const level = s.threat_level || 'NORMAL';
       const color = threatLevelColor(level);
       const evidence = s.evidence || [];
+      const srcTypeRaw = s.source_type || 'EXTERNAL SOURCE';
+      const srcType = normalizeSourceTypeLabel(srcTypeRaw);
+      const proc = normalizeText(s.process, 'unknown process');
+      const rawDom = s.domain || s.source_domain || '';
+      const domain = (rawDom && rawDom !== 'unknown') ? normalizeText(rawDom, 'unknown') : '—';
+      const isp = s.isp_org && s.isp_org !== 'unresolved' ? s.isp_org : '';
+      const threatIp = normalizeText(s.ip, 'unknown');
+      const riskVal = (typeof s.risk === 'number') ? s.risk : (s.risk_score || 0);
+      const actionVal = (s.action || 'MONITOR').toUpperCase();
+      const isBlocked = Boolean(s.is_blocked) || actionVal === 'BLOCK' || actionVal === 'TEMP_BLOCK';
+      const reasonVal = normalizeText(s.reason || s.reasoning, 'No reasoning available');
+      // Hard guard: do not render incomplete noisy cards.
+      if (threatIp === 'unknown') return;
+      // Never render internal/deployment activity in Top Threats cards.
+      if (srcType.includes('SYSTEM') || srcType.includes('LOCAL DEVICE')) return;
+      const srcLine = `${threatIp} | ${srcType} | ${proc} | ${domain}${isp ? ' | ' + isp : ''} | Risk: ${riskVal} | Action: ${actionVal}`;
+      const srcBadgeCls = srcType.includes('LOCAL') ? 'badge-internal' :
+        (srcType.includes('EXTERNAL') ? 'badge-external' : 'badge-monitor');
 
       const card = document.createElement('div');
       card.className = 'threat-card';
       card.innerHTML = `
         <div class="threat-card-header">
-          <span class="threat-ip">${s.ip}</span>
-          <span class="threat-score-big" style="color:${color}">${s.score}</span>
+          <span class="threat-ip">${escHTML(threatIp)}</span>
+          <span class="threat-score-big" style="color:${color}">${riskVal}</span>
+        </div>
+        <div style="margin-top:6px;color:var(--text-muted);font-family:var(--font-mono);font-size:0.86rem;line-height:1.2">
+          ${escHTML(srcLine)}
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          ${ipTypeBadge(s.threat_state?.ip_type || '')}
+          <span class="badge ${srcBadgeCls}">${escHTML(srcType)}</span>
           <span class="badge" style="background:rgba(255,100,100,0.1);color:${color};border:1px solid ${color}40">${level}</span>
-          <span class="badge badge-${(s.action||'monitor').toLowerCase().replace('_','-')}">${s.action || 'MONITOR'}</span>
+          ${isBlocked ? `<span class="badge badge-block">BLOCKED</span>` : ''}
+          <span class="badge badge-${(actionVal||'monitor').toLowerCase().replace('_','-')}">${actionVal}</span>
         </div>
+        <div style="margin-top:6px;color:var(--text-muted);font-size:0.82rem;line-height:1.2">${escHTML(String(reasonVal).substring(0, 120))}</div>
         <div class="threat-tags">${tagsHTML(s.threat_tags)}</div>
         <div class="threat-evidence">
           ${evidence.map(e => `
@@ -559,16 +663,28 @@ async function fetchBlockedCards() {
       return;
     }
 
-    data.forEach(e => {
+    data
+      .filter(e => (String(e.action || 'BLOCK').toUpperCase() === 'BLOCK') || e.active === 1 || e.active === true)
+      .forEach(e => {
+      // Hide malformed "domain" rows that are actually IP or IP:port artifacts.
+      if (String(e.entity_type || '').toUpperCase() === 'DOMAIN' && looksLikeIpOrIpPort(e.entity_value)) return;
       const card = document.createElement('div');
       card.className = 'blocked-card';
+      const riskVal = (typeof e.risk === 'number') ? e.risk : 0;
+      const ipVal = normalizeText(e.ip || (e.entity_type === 'IP' ? e.entity_value : 'unknown'), 'unknown');
+      const processVal = normalizeText(e.process, 'external traffic');
+      const domainVal = normalizeText(e.domain, 'unknown');
+      const attackType = normalizeText(e.attack_type, 'SUSPICIOUS_BEHAVIOR');
+      const reason = normalizeText(e.reason, 'Blocked by policy');
       card.innerHTML = `
         <div class="blocked-card-header">
           <span class="blocked-type">${e.entity_type}</span>
           <span class="badge badge-block">BLOCKED</span>
         </div>
-        <div class="blocked-value">${e.entity_value}</div>
-        <div class="blocked-reason">${(e.reason || '').substring(0, 100)}</div>
+        <div class="blocked-value">${normalizeText(e.entity_value, 'unknown')}</div>
+        <div class="blocked-reason">IP: ${ipVal} | Risk: ${riskVal} | Attack: ${attackType} | Action: BLOCK</div>
+        <div class="blocked-reason">Process: ${processVal} | Domain: ${domainVal}</div>
+        <div class="blocked-reason">${reason.substring(0, 220)}</div>
         <div class="blocked-time">Blocked at: ${new Date(e.timestamp).toLocaleString()}</div>
         ${e.entity_type === 'IP' ? `<button class="unblock-btn" onclick="manualUnblockIP('${e.entity_value}')">🔓 Manual Unblock</button>` : ''}
       `;

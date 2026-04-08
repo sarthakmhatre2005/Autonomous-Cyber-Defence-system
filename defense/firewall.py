@@ -15,26 +15,27 @@ def block_ip(ip):
     """Blocks an IP using Windows Firewall."""
     if platform.system() != "Windows":
         print(f"Skipping IP block for {ip} (Not Windows)")
-        return
+        return True
 
     rule_name = f"Block_{ip}"
     
     # SAFETY: Do not block localhost/127.0.0.1 during testing to avoid locking user out of dashboard
     if ip in ["127.0.0.1", "::1", "localhost"]:
         print(f"Safety: Skipping actual Windows Firewall block for {ip} (Localhost). Action logged in DB.")
-        return
+        return True
 
     if not is_admin():
         print(f"[ERROR] Failed to block IP {ip}: Administrator privileges required. Please run as Administrator.")
-        return
+        return False
 
     cmd = f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=block remoteip={ip}"
     try:
         subprocess.run(cmd, shell=True, check=True, capture_output=True)
-        print(f"Blocked IP: {ip}")
+        return True
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode().strip() if e.stderr else str(e)
         print(f"Failed to block IP {ip}: {error_msg}")
+        return False
 
 def unblock_ip(ip):
     """Unblocks an IP."""
@@ -53,10 +54,10 @@ def unblock_ip(ip):
     except subprocess.CalledProcessError as e:
         # Ignore if rule doesn't exist, but report permission issues
         if "requires elevation" in str(e.stderr):
-             print(f"[ERROR] Failed to unblock IP {ip}: Administrator privileges required.")
+            print(f"[ERROR] Failed to unblock IP {ip}: Administrator privileges required.")
 
 def block_domain(domain):
-    """Blocks a domain by modifying the hosts file to redirect to localhost."""
+    """Blocks a domain by modifying the hosts file to redirect to localhost. Returns True on success."""
     hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
     if platform.system() != "Windows":
         hosts_path = "/etc/hosts"
@@ -76,12 +77,15 @@ def block_domain(domain):
             with open(hosts_path, "a") as f:
                 for entry in to_add:
                     f.write(entry)
-            print(f"Blocked Domain: {domain}")
-            # Ensure it is logged in the actions table
             from data.database import log_action
             log_action("DOMAIN", domain, "BLOCK", f"Hosts file redirection applied.")
+        return True
     except PermissionError:
-        print(f"Permission denied blocking domain {domain}. Run as Admin.")
+        print(f"[Firewall] Permission denied blocking domain {domain}. Run as Admin.")
+        return False
+    except Exception as e:
+        print(f"[Firewall] Domain block failed for {domain}: {e}")
+        return False
 
 def unblock_domain(domain):
     """Unblocks a domain."""

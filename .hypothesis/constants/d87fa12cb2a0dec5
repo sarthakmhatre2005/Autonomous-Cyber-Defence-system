@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\data\database.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.1, 100, 10000, '0.0.0.0', 'BLOCK', 'EXTERNAL_SOURCE', 'INTEGER DEFAULT 0', 'IP', 'LOW', 'N/A', 'No reason provided', 'Queue Full', 'SUSPICIOUS', 'SUSPICIOUS_BEHAVIOR', 'TEXT', 'UNKNOWN', 'a', 'action', 'anomalies', 'args', 'attack_type', 'blocked', 'count', 'cyber_defense.db', 'domain', 'entity_type', 'entity_value', 'error', 'external_ips_tracked', 'func', 'high_threat_ips', 'ip', 'kwargs', 'last_seen', 'locked', 'past_blocks', 'process', 'reason', 'risk', 'source_type', 'suspicious_ips', 'threat_level', 'timestamp', 'total_flags', 'total_ips_tracked', 'total_requests', 'unknown', 'unknown process', '{}']

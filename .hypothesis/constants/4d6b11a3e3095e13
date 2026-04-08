@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\core\decision_engine.py
+# hypothesis_version: 6.151.9
+
+[0.8, '127.0.0.1', '::1', 'BLOCK', 'CRITICAL', 'DOMAIN', 'DO_NOTHING', 'HIGH', 'HONEYPOT_HIT', 'IP', 'LOCAL_DEVICE', 'LOG', 'LOW', 'MEDIUM', 'MONITOR', 'PROCESS', 'RATE_LIMIT', 'SUSPICIOUS_BEHAVIOR', 'SYSTEM', 'Severity is HIGH.', 'Severity is LOW.', 'TEMP_BLOCK', 'TERMINATE', 'action_type', 'entity_value', 'localhost', 'name', 'pid', 'severity', 'source_ip']

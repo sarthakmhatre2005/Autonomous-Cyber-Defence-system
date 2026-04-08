@@ -4,7 +4,7 @@ Traffic Behavior Analyzer
 - Detects: port scans, connection bursts, brute force, traffic spikes
 - Maintains per-IP behavioral profiles
 - Feeds data into the Threat Scoring Engine
-- OPTIMIZED: throttled logging, low-overhead hot-path, 8 async workers
+- OPTIMIZED: throttled logging, low-overhead hot-path, async worker pool
 """
 
 import time
@@ -14,7 +14,7 @@ from datetime import datetime
 import queue
 
 from monitoring.packet_capture import get_ip_type
-from monitoring.website_analyzer import website_analyzer
+from monitoring.website_analyzer import website_analyzer, is_noise_domain
 from data.database import log_dns_query, log_event
 from core.threat_engine import threat_engine
 from core.fingerprint_engine import fingerprint_engine
@@ -24,7 +24,10 @@ from ml.ml_detector import ml_detector  # module-level singleton — do NOT use 
 _DNS_LOG_THROTTLE   = {}   # domain -> last_logged_time
 _ML_CALL_THROTTLE   = {}   # src_ip -> last_ml_time
 _DNS_THROTTLE_SEC   = 30   # re-log same domain at most every 30s
-_ML_THROTTLE_SEC    = 5    # re-run ML per IP at most every 5s
+_ML_THROTTLE_SEC    = 3.5  # re-run ML per IP (seconds)
+_FP_THROTTLE_SEC    = 0.25  # fingerprint_engine: throttle hot path
+_STATS_SKIP_SEC     = 0.06  # skip heavy detection if same IP analyzed recently (non-DNS)
+FAST_SAMPLE_N       = 6     # on fast path, run full detection every Nth packet
 
 
 # ─── IP Behavior Profile ──────────────────────────────────────────────────────
@@ -38,7 +41,7 @@ class IPProfile:
         self._lock = threading.Lock()
 
         # Packet history (sliding window, 60s)
-        self.packet_times = deque(maxlen=1000)   # timestamps
+        self.packet_times = deque(maxlen=500)   # timestamps (smaller = faster scans)
         self.ports_contacted = set()              # all unique ports touched
         self.port_timeline = deque(maxlen=200)    # (timestamp, port) pairs
         self.protocols_seen = set()
@@ -207,9 +210,9 @@ class TrafficAnalyzer:
         self._stats_cache = {}
         self._stats_cache_lock = threading.Lock()
 
-        # Async worker pool — 16 threads for high throughput
-        self.num_workers = 16
-        self.packet_queue = queue.Queue(maxsize=100000)
+        # Async worker pool — fewer threads reduces lock contention on shared profiles
+        self.num_workers = 10
+        self.packet_queue = queue.Queue(maxsize=50000)
         self._workers = []
         for i in range(self.num_workers):
             t = threading.Thread(target=self._worker_loop, name=f"AnalyzerWorker-{i}", daemon=True)
@@ -218,6 +221,12 @@ class TrafficAnalyzer:
 
         # LRU cache for domain analysis to avoid repeated computation
         self._domain_cache = {}
+
+        # Brute-force port attempt timeline per IP
+        self.connection_attempts = defaultdict(lambda: deque(maxlen=150))
+
+        # Last fingerprint update time per IP (throttle hot path)
+        self._fp_last_ts = {}
 
         # Cache common objects (module-level singletons referenced directly)
         self.threat_engine = threat_engine
@@ -228,6 +237,8 @@ class TrafficAnalyzer:
         while True:
             try:
                 meta = self.packet_queue.get()
+                if meta is None:
+                    continue
                 self._analyze_packet(meta)
             except Exception:
                 pass
@@ -268,6 +279,8 @@ class TrafficAnalyzer:
         if dst_port == 5000 or src_port == 5000:
             return
 
+        ip_type = get_ip_type(src_ip)
+
         if dst_port is not None or src_port is not None:
             from monitoring.packet_capture import get_process_for_packet
             proto = meta.get("protocol", "TCP")
@@ -286,15 +299,13 @@ class TrafficAnalyzer:
             except:
                 pass
 
-        # IP Classification (cached in packet_capture)
-        ip_type = get_ip_type(src_ip)
         meta["ip_type"] = ip_type
 
         # QUIC detection (UDP 443)
         if meta["protocol"] == "UDP" and (dst_port == 443 or src_port == 443):
             meta["protocol"] = "QUIC"
 
-        # Update global packet store ring buffer
+        # Update global packet store ring buffer (always — keeps UI packet stream continuous)
         from monitoring.packet_capture import packet_store
         packet_store.add(meta)
 
@@ -304,6 +315,10 @@ class TrafficAnalyzer:
         self.total_packets += 1
         if ip_type == "EXTERNAL":
             self.external_packets += 1
+
+        # Pure loopback: keep packets in store; skip threat / ML / fingerprint noise
+        if ip_type == "LOOPBACK":
+            return
         
         # ─── DNS Analysis (Decoding offloaded to worker) ───
         now = time.time()
@@ -314,11 +329,14 @@ class TrafficAnalyzer:
             # In our current scapy implementation, we'll try to get it if possible.
             dns_query = meta.get("dns_query")
 
-        # ─── Attacker Fingerprinting ───
+        # ─── Attacker Fingerprinting (throttled — runs on every packet by default) ───
         try:
-            fingerprint_engine.process_network_event(
-                src_ip, meta.get("dst_port", 0), meta.get("timestamp", now)
-            )
+            last_fp = self._fp_last_ts.get(src_ip, 0.0)
+            if now - last_fp >= _FP_THROTTLE_SEC:
+                self._fp_last_ts[src_ip] = now
+                fingerprint_engine.process_network_event(
+                    src_ip, meta.get("dst_port", 0), meta.get("timestamp", now)
+                )
         except Exception:
             pass
 
@@ -326,6 +344,9 @@ class TrafficAnalyzer:
 
         # ─── DNS Monitoring ── throttled: analyze domain but log only every 30s ───
         if dns_query:
+            # Drop noisy/system DNS traffic before detection/logging (not at capture).
+            if is_noise_domain(dns_query):
+                return
             if dns_query in self._domain_cache:
                 threat_score, reasons = self._domain_cache[dns_query]
             else:
@@ -379,14 +400,15 @@ class TrafficAnalyzer:
         cached_info = self._stats_cache.get(src_ip)
         if cached_info:
             last_analysis, packet_rate, port_count, pkt_count = cached_info
-            # If we analyzed this IP very recently (< 50ms) and it's not a DNS packet, 
-            # we can skip the heavy checks.
-            if now - last_analysis < 0.05 and not meta.get("has_dns"):
+            # If we analyzed this IP very recently (< 50ms) and it's not a DNS packet,
+            # we can skip heavy analysis for most packets while still sampling regularly.
+            if now - last_analysis < _STATS_SKIP_SEC and not meta.get("has_dns"):
                 should_analyze = False
-                # Still increment packet count in cache to detect rapid bursts
                 self._stats_cache[src_ip] = (last_analysis, packet_rate, port_count, pkt_count + 1)
-                # If burst is extreme, force analysis
-                if pkt_count > 50: should_analyze = True
+                if (pkt_count + 1) % FAST_SAMPLE_N == 0:
+                    should_analyze = True
+                if pkt_count > 50:
+                    should_analyze = True
 
         if not should_analyze:
             return
@@ -416,7 +438,7 @@ class TrafficAnalyzer:
 
         # ─── Detection Methods (Using optimized stats) ───
         alerts += self._detect_port_scan(src_ip, profile, port_count_60s)
-        alerts += self._detect_connection_burst(src_ip, profile, packet_rate_10s)
+        alerts += self._detect_connection_burst(src_ip, profile, packet_rate_10s, alerts)
         alerts += self._detect_brute_force(src_ip, profile, meta)
         alerts += self._detect_high_risk_port(src_ip, profile, meta)
         alerts += self._detect_traffic_spike(src_ip, profile, meta)
@@ -432,6 +454,8 @@ class TrafficAnalyzer:
             for alert in alerts:
                 alert["ip"] = src_ip
                 alert["ip_type"] = ip_type
+                # Best-effort process mapping for UI/logging (safe fallback).
+                alert["process"] = meta.get("process") or "unknown process"
                 self.alert_queue.append(alert)
                 try:
                     self.threat_engine.process_alert(alert, profile)
@@ -471,7 +495,6 @@ class TrafficAnalyzer:
                 "ports_sample": sorted_ports[:10],
                 "timestamp": time.time(),
             })
-            print(f"[PortScan] {ip} ({profile.ip_type}): {port_count} ports — {scan_type}")
 
         elif port_count >= SUSPICIOUS_THRESHOLD and "SUSPICIOUS_PORTSCAN" not in profile.threat_tags:
             profile.threat_tags.append("SUSPICIOUS_PORTSCAN")
@@ -501,41 +524,76 @@ class TrafficAnalyzer:
 
     # ── Detection: Connection Burst ───────────────────────────────────────────
 
-    def _detect_connection_burst(self, ip, profile, rate):
+    def _corroborating_signals(self, prior_alerts):
+        """Non-burst signals that justify higher severity (not spike alone)."""
+        for a in prior_alerts or []:
+            t = (a.get("type") or "").upper()
+            if t in ("ML_ANOMALY", "PORT_SCAN", "SUSPICIOUS_PORTSCAN", "BRUTE_FORCE", "DNS_THREAT", "HIGH_RISK_PORT"):
+                return True
+        return False
+
+    def _detect_connection_burst(self, ip, profile, rate, prior_alerts):
         """
-        Connection burst: > 20 connections from same IP in 10 seconds.
-        Could indicate DDoS, scanner, or automated attack.
+        Connection burst / spike: high packet rate in 10s window.
+        Spike alone is not treated as highly malicious; pair with corroboration or repetition.
         """
         alerts = []
 
         BURST_THRESHOLD = 10   # packets/sec = burst
         SEVERE_BURST = 30       # extreme burst
 
+        corroborating = self._corroborating_signals(prior_alerts)
+        # Burst episode counter (repeat burst after cooldown resets is_bursting)
+        if not hasattr(profile, "_burst_episodes"):
+            profile._burst_episodes = 0
+        repeated_burst = profile._burst_episodes >= 1
+
         if rate >= SEVERE_BURST and not profile.is_bursting:
             profile.is_bursting = True
+            profile._burst_episodes = getattr(profile, "_burst_episodes", 0) + 1
             if "CONNECTION_BURST" not in profile.threat_tags:
                 profile.threat_tags.append("CONNECTION_BURST")
+            spike_only = not corroborating and not repeated_burst
+            if spike_only:
+                severity = "MEDIUM"
+                score = 2
+                detail = f"Connection spike (high rate): {rate:.1f} pkt/s [no corroborating signals — low priority]"
+            else:
+                severity = "HIGH"
+                score = 5
+                detail = f"Severe connection burst: {rate:.1f} pkt/s"
             alerts.append({
                 "type": "CONNECTION_BURST",
-                "severity": "HIGH",
-                "score": 5,
-                "detail": f"Severe connection burst: {rate:.1f} pkt/s",
+                "severity": severity,
+                "score": score,
+                "detail": detail,
                 "rate": rate,
                 "timestamp": time.time(),
+                "spike_only": spike_only,
             })
-            print(f"[Burst] {ip}: SEVERE burst {rate:.1f} pkt/s")
 
         elif rate >= BURST_THRESHOLD and not profile.is_bursting:
             profile.is_bursting = True
+            profile._burst_episodes = getattr(profile, "_burst_episodes", 0) + 1
             if "CONNECTION_BURST" not in profile.threat_tags:
                 profile.threat_tags.append("CONNECTION_BURST")
+            spike_only = not corroborating and not repeated_burst
+            if spike_only:
+                severity = "LOW"
+                score = 1
+                detail = f"Connection spike: {rate:.1f} pkt/s [no corroborating signals — low priority]"
+            else:
+                severity = "MEDIUM"
+                score = 3
+                detail = f"Connection burst: {rate:.1f} pkt/s"
             alerts.append({
                 "type": "CONNECTION_BURST",
-                "severity": "MEDIUM",
-                "score": 3,
-                "detail": f"Connection burst: {rate:.1f} pkt/s",
+                "severity": severity,
+                "score": score,
+                "detail": detail,
                 "rate": rate,
                 "timestamp": time.time(),
+                "spike_only": spike_only,
             })
 
         elif rate < 2:
@@ -579,7 +637,6 @@ class TrafficAnalyzer:
                 "attempts": recent_count,
                 "timestamp": time.time(),
             })
-            print(f"[BruteForce] {ip}: {recent_count} attempts on port {dst_port}")
 
         return alerts
 
@@ -602,7 +659,6 @@ class TrafficAnalyzer:
                     "target_port": dst_port,
                     "timestamp": time.time(),
                 })
-                print(f"[HighRiskPort] {ip}: port {dst_port}")
 
         return alerts
 

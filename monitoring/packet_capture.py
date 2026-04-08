@@ -7,7 +7,7 @@ import threading
 import time
 import socket
 import ipaddress
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from datetime import datetime
 
 # Try scapy import
@@ -95,6 +95,10 @@ class PacketStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._packets = deque(maxlen=self.MAX_SIZE)
+        # Flow dedupe: OrderedDict capped by count — O(1) eviction, no full-table scans.
+        self._recent_scapy_flows = OrderedDict()  # flow_key -> ts
+        self._dedupe_window_sec = 1.5
+        self._max_flow_keys = 2500
         # Per-IP packet rate tracking: ip -> list of timestamps
         self.ip_timestamps = defaultdict(lambda: deque(maxlen=500))
         # Per-IP port tracking: ip -> set of ports
@@ -116,8 +120,28 @@ class PacketStore:
         bytes_count = pkt_meta.get("payload_size", 0)
         protocol = pkt_meta.get("protocol")
         ip_type = pkt_meta.get("ip_type", "INTERNAL")
+        src = pkt_meta.get("source", "")
+        flow_key = (
+            protocol or "OTHER",
+            pkt_meta.get("src_ip", ""),
+            pkt_meta.get("src_port", 0) or 0,
+            pkt_meta.get("dst_ip", ""),
+            pkt_meta.get("dst_port", 0) or 0,
+        )
 
         with self._lock:
+            # If scapy already captured this flow recently, skip psutil duplicate row.
+            if src == "psutil":
+                last_scapy = self._recent_scapy_flows.get(flow_key, 0.0)
+                if last_scapy and (float(ts) - float(last_scapy)) <= self._dedupe_window_sec:
+                    return
+            elif src == "scapy":
+                # Refresh position for LRU-style cap
+                self._recent_scapy_flows.pop(flow_key, None)
+                self._recent_scapy_flows[flow_key] = float(ts)
+                while len(self._recent_scapy_flows) > self._max_flow_keys:
+                    self._recent_scapy_flows.popitem(last=False)
+
             self._packets.append(pkt_meta)
             self.ip_timestamps[ip].append(ts)
             if port:
@@ -221,6 +245,7 @@ def handle_packet(pkt):
         # Minimal metadata for the queue
         meta = {
             "timestamp": time.time(),
+            "datetime": datetime.now().isoformat(),
             "src_ip": src_ip,
             "dst_ip": dst_ip,
             "protocol": "OTHER",
@@ -230,10 +255,10 @@ def handle_packet(pkt):
 
         # Pass protocol and ports for the worker to correlate with processes
         if pkt.haslayer(TCP):
+            tcp = pkt[TCP]
             meta["protocol"] = "TCP"
-            meta["dst_port"] = pkt[TCP].dport
-            meta["src_port"] = pkt[TCP].sport
-            meta["flags"] = str(pkt[TCP].flags)
+            meta["dst_port"] = tcp.dport
+            meta["src_port"] = tcp.sport
         elif pkt.haslayer(UDP):
             meta["protocol"] = "UDP"
             meta["dst_port"] = pkt[UDP].dport
@@ -249,11 +274,13 @@ def handle_packet(pkt):
                 try: meta["_dns_raw_qname"] = pkt[DNSQR].qname 
                 except: pass
 
+        # Capture all packets here; loopback / noise filtering happens in the analyzer (not at capture).
+
         # Forward to analysis layer IMMEDIATELY
         if _traffic_analyzer_cached is None:
             from monitoring.traffic_analyzer import traffic_analyzer
             _traffic_analyzer_cached = traffic_analyzer
-        
+
         _traffic_analyzer_cached.process_packet(meta)
 
     except Exception:
@@ -443,12 +470,14 @@ connection_monitor = ConnectionMonitor()
 
 def start_connection_monitor():
     """Run psutil connection monitor in background loop."""
+    # net_connections() is expensive on Windows; when Scapy runs, poll less often.
+    interval = 4.0 if SCAPY_AVAILABLE else 2.0
     while True:
         try:
             connection_monitor.scan_connections()
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(interval)
 
 
 # ─── Network Interface Stats ──────────────────────────────────────────────────

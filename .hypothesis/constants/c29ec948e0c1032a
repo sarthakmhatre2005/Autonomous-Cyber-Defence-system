@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\core\risk_engine.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.05, 0.1, 0.2, 0.75, 0.8, 0.9, 1.2, 5.0, 30.0, 100, 300, 'ACCESS_ATTEMPT', 'BRUTE_FORCE', 'CONNECTION_BURST', 'CONNECTION_SPIKE', 'HONEYPOT_HIT', 'LOCAL_DEVICE', 'ML_ANOMALY', 'PORT_SCAN', 'RECONNAISSANCE', 'SUSPICIOUS_BEHAVIOR', 'SUSPICIOUS_PORTSCAN', 'SYSTEM', 'UNKNOWN', 'abnormal spike', 'bursty timing', 'chrome.exe', 'dst_port', 'external traffic', 'ip', 'last_risk_score', 'msedge.exe', 'past_blocks', 'seen_times', 'spike_only', 'src_port', 'system', 'target_port', 'total_flags', 'type', 'unknown', 'whatsapp.exe']

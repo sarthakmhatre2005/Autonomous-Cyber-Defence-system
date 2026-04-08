@@ -1,0 +1,4 @@
+# file: D:\Autonomous Cyber Defence system\monitoring\packet_capture.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1.5, 2.0, 4.0, 100, 443, 500, 1024, 2000, 2500, 5000, '.', '0.0.0.0', '10.', '10.0.0.0/8', '127.', '127.0.0.0/8', '127.0.0.1', '169.254.0.0/16', '172.16.0.0/12', '192.168.', '192.168.0.0/16', '8.8.8.8', '::1', '::1/128', 'EXTERNAL', 'ICMP', 'INTERNAL', 'LOOPBACK', 'OTHER', 'QUIC', 'SYSTEM', 'TCP', 'UDP', 'UNKNOWN', '_dns_raw_qname', 'datetime', 'description', 'dst_ip', 'dst_port', 'ethernet', 'external_captured', 'fc00::/7', 'flags', 'gigabit', 'has_dns', 'inet', 'intel', 'interface', 'internal_captured', 'ip and not port 5000', 'ip_type', 'ips', 'is_up', 'localhost', 'payload_size', 'pid', 'process', 'protocol', 'psutil', 'realtek', 'scapy', 'source', 'speed', 'src_ip', 'src_port', 'timestamp', 'total_captured', 'ttl', 'unique_ips', 'wi-fi', 'wireless', 'wlan']

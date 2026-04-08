@@ -164,7 +164,8 @@ def monitor_processes():
                         log_event(
                             src_ip="127.0.0.1", dest_ip="LOCAL", protocol="SYSTEM",
                             severity="LOW", anomaly_score=0.0, active_window=name,
-                            details={"pid": pid, "type": "New Process"}
+                            # Include app name so the dashboard can render "chrome.exe started"
+                            details={"pid": pid, "app": name, "type": "New Process", "event": f"{name} started"}
                         )
                         threading.Thread(target=track_process_connections, args=(pid, name), daemon=True).start()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -182,7 +183,8 @@ def monitor_processes():
                             log_event(
                                 src_ip="127.0.0.1", dest_ip="LOCAL", protocol="SYSTEM",
                                 severity="HIGH", anomaly_score=score/10.0, active_window=p_name,
-                                details={"pid": pid, "score": score, "event": f"Process Kill: {p_name}"},
+                                # Include app name for clearer event rendering
+                                details={"pid": pid, "app": p_name, "score": score, "type": "Process Kill", "event": f"{p_name} suspicious activity detected"},
                                 threat_score=int(score)
                             )
                             proc.terminate()

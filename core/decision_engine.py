@@ -48,6 +48,53 @@ def evaluate_threat_action(ip, score, evidence_count):
         return "LOG"
     return "MONITOR"
 
+
+def progressive_decide_action(
+    *,
+    risk: int,
+    repeat_strong: int,
+    confidence: float,
+    source_type: str,
+    attack_type: str,
+    threat_level: str = "",
+) -> str:
+    """
+    Safety-biased progressive escalation.
+
+    Returns one of: MONITOR | LOG | BLOCK
+    Mandatory BLOCK when risk >= 90 or threat_level is CRITICAL (unless whitelisted at execution).
+    """
+    source_type = (source_type or "").upper().strip()
+
+    thr = (threat_level or "").upper().strip()
+
+    # Critical override (except whitelist checks in execution layer).
+    if risk >= 90 or thr == "CRITICAL":
+        return "BLOCK"
+
+    # Internal safety rule: do not block internal unless extremely high risk.
+    if source_type in ("SYSTEM", "LOCAL_DEVICE") and risk < 80:
+        return "MONITOR"
+
+    # Single strong signals should be visible early.
+    if risk < 60:
+        if (attack_type or "") == "HONEYPOT_HIT":
+            return "LOG"
+        # Single strong ML anomalies should be visible immediately.
+        if (attack_type or "") == "SUSPICIOUS_BEHAVIOR":
+            return "LOG"
+        return "MONITOR"
+
+    # Moderate-high risk: log / monitor.
+    if risk < 80:
+        return "LOG"
+
+    # Very high risk: require strong confirmation.
+    if repeat_strong >= 3 and confidence > 0.8:
+        return "BLOCK"
+
+    return "LOG"
+
 def evaluate_event(event):
     """
     Decides validation based on severity and history.

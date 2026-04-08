@@ -160,6 +160,21 @@ def init_db():
                     reason TEXT,
                     active INTEGER DEFAULT 1
                 )''')
+    # Backward-compatible enrichments for unified threat object storage.
+    for col, typ in (
+        ("ip", "TEXT"),
+        ("domain", "TEXT"),
+        ("process", "TEXT"),
+        ("source_type", "TEXT"),
+        ("risk", "INTEGER DEFAULT 0"),
+        ("threat_level", "TEXT"),
+        ("attack_type", "TEXT"),
+        ("action", "TEXT"),
+    ):
+        try:
+            c.execute(f"ALTER TABLE blocked_entities ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS whitelist (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,8 +213,70 @@ def init_db():
                     data TEXT
                 )''')
 
+    # ─── Persistent IP Memory (hybrid RAM + DB) ─────────────────────────────
+    c.execute('''CREATE TABLE IF NOT EXISTS ip_memory (
+                    ip TEXT PRIMARY KEY,
+                    total_flags INTEGER DEFAULT 0,
+                    past_blocks INTEGER DEFAULT 0,
+                    last_seen REAL DEFAULT 0.0
+                )''')
+
     conn.commit()
     conn.close()
+
+
+def load_ip_memory():
+    """
+    Load persistent IP behavior memory into RAM on startup.
+    Returns: dict[ip] = {"total_flags": int, "past_blocks": int, "last_seen": float}
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT ip, total_flags, past_blocks, last_seen FROM ip_memory")
+        rows = c.fetchall()
+        conn.close()
+        out = {}
+        for r in rows:
+            ip = r["ip"]
+            out[ip] = {
+                "total_flags": int(r["total_flags"] or 0),
+                "past_blocks": int(r["past_blocks"] or 0),
+                "last_seen": float(r["last_seen"] or 0.0),
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def save_ip_memory(ip, data):
+    """
+    Save/Upsert IP memory to DB asynchronously.
+    data expected keys: total_flags, past_blocks, last_seen
+    """
+    def _write(conn, ip, total_flags, past_blocks, last_seen):
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO ip_memory (ip, total_flags, past_blocks, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+                total_flags=excluded.total_flags,
+                past_blocks=excluded.past_blocks,
+                last_seen=excluded.last_seen
+            """,
+            (ip, int(total_flags), int(past_blocks), float(last_seen)),
+        )
+
+    try:
+        total_flags = data.get("total_flags", 0)
+        past_blocks = data.get("past_blocks", 0)
+        last_seen = data.get("last_seen", time.time())
+        db_logger.submit(_write, ip, total_flags, past_blocks, last_seen)
+    except Exception:
+        # Never crash the detection pipeline due to persistence errors.
+        pass
 
 def log_event(src_ip="0.0.0.0", dest_ip="0.0.0.0", src_port=0, dst_port=0, protocol="UNKNOWN", 
               payload_size=0, severity="LOW", anomaly_score=0.0, active_window="N/A", details=None, threat_score=0):
@@ -227,16 +304,63 @@ def log_action(entity_type, entity_value, action_type, reason):
         )
     db_logger.submit(_write, entity_type, entity_value, action_type, reason)
 
-def block_entity_db(entity_type, entity_value, reason):
-    def _write(conn, entity_type, entity_value, reason):
-        c = conn.cursor()
-        c.execute("SELECT id FROM blocked_entities WHERE entity_type=? AND entity_value=? AND active=1", (entity_type, entity_value))
-        if c.fetchone(): return
-        c.execute(
-            "INSERT INTO blocked_entities (entity_type, entity_value, timestamp, reason, active) VALUES (?, ?, ?, ?, 1)",
-            (entity_type, entity_value, datetime.now().isoformat(), reason)
-        )
-    db_logger.submit(_write, entity_type, entity_value, reason)
+def _blocked_entity_insert(conn, entity_type, entity_value, reason, threat_object):
+    """Ensure an active blocked_entities row exists. Idempotent if already active."""
+    c = conn.cursor()
+    c.execute(
+        "SELECT id FROM blocked_entities WHERE entity_type=? AND entity_value=? AND active=1",
+        (entity_type, entity_value),
+    )
+    if c.fetchone():
+        return
+    threat_object = threat_object or {}
+    ip = str(threat_object.get("ip") or (entity_value if entity_type == "IP" else "unknown"))
+    domain = str(threat_object.get("domain") or ("unknown" if entity_type == "IP" else entity_value))
+    process = str(threat_object.get("process") or "unknown process")
+    source_type = str(threat_object.get("source_type") or "EXTERNAL_SOURCE")
+    risk = int(threat_object.get("risk") or 0)
+    threat_level = str(threat_object.get("threat_level") or "SUSPICIOUS")
+    attack_type = str(threat_object.get("attack_type") or "SUSPICIOUS_BEHAVIOR")
+    action = str(threat_object.get("action") or "BLOCK")
+    c.execute(
+        """INSERT INTO blocked_entities
+           (entity_type, entity_value, timestamp, reason, active, ip, domain, process, source_type, risk, threat_level, attack_type, action)
+           VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            entity_type,
+            entity_value,
+            datetime.now().isoformat(),
+            reason,
+            ip,
+            domain,
+            process,
+            source_type,
+            risk,
+            threat_level,
+            attack_type,
+            action,
+        ),
+    )
+
+
+def block_entity_db(entity_type, entity_value, reason, threat_object=None):
+    def _write(conn, entity_type, entity_value, reason, threat_object):
+        _blocked_entity_insert(conn, entity_type, entity_value, reason, threat_object)
+
+    db_logger.submit(_write, entity_type, entity_value, reason, threat_object)
+
+
+def block_entity_db_sync(entity_type, entity_value, reason, threat_object=None):
+    """Same as block_entity_db but commits immediately so UI/API see the row right away."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        _blocked_entity_insert(conn, entity_type, entity_value, reason, threat_object)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def unblock_entity_db(entity_type, entity_value):
     try:
@@ -305,7 +429,21 @@ def get_blocked_entities(limit=50):
         c.execute("SELECT * FROM blocked_entities WHERE active=1 ORDER BY id DESC LIMIT ?", (limit,))
         rows = c.fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+        out = []
+        for row in rows:
+            d = dict(row)
+            # Return full object shape with safe defaults.
+            d["ip"] = str(d.get("ip") or (d.get("entity_value") if d.get("entity_type") == "IP" else "unknown"))
+            d["domain"] = str(d.get("domain") or ("unknown" if d.get("entity_type") == "IP" else (d.get("entity_value") or "unknown")))
+            d["process"] = str(d.get("process") or "unknown process")
+            d["source_type"] = str(d.get("source_type") or "EXTERNAL_SOURCE")
+            d["risk"] = int(d.get("risk") or 0)
+            d["threat_level"] = str(d.get("threat_level") or "SUSPICIOUS")
+            d["attack_type"] = str(d.get("attack_type") or "SUSPICIOUS_BEHAVIOR")
+            d["action"] = str(d.get("action") or "BLOCK")
+            d["reason"] = str(d.get("reason") or "No reason provided")
+            out.append(d)
+        return out
     except: return []
 
 def get_top_ips(limit=10):

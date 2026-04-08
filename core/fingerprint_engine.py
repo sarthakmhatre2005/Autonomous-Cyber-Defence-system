@@ -45,8 +45,8 @@ class FingerprintEngine:
             if dst_port:
                 p["port_history"].append((timestamp, dst_port))
 
-            # Only fingerprint every 50 packets to avoid CPU overhead
-            if p["packet_count"] % 50 == 0:
+            # Only fingerprint periodically to avoid CPU overhead
+            if p["packet_count"] % 100 == 0:
                 self._classify(src_ip, p)
 
     def _classify(self, ip: str, profile: dict):

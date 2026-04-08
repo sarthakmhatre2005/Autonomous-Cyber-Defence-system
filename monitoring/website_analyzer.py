@@ -1,5 +1,6 @@
 import re
 import math
+import ipaddress
 from collections import Counter
 
 # High-risk keywords used in phishing/malicious domains
@@ -12,6 +13,43 @@ PHISHING_KEYWORDS = [
 
 # Common safe domains to reduce false positives
 WHITELIST = ["google.com", "bing.com", "github.com", "microsoft.com", "apple.com", "amazon.com", "facebook.com", "twitter.com"]
+
+
+def is_noise_domain(domain):
+    if not domain:
+        return True
+
+    domain = str(domain).strip().lower().rstrip(".")
+
+    # Reverse DNS
+    if domain.endswith(".in-addr.arpa"):
+        return True
+
+    # Local network / multicast
+    if domain.endswith(".local"):
+        return True
+
+    # System / internal patterns
+    if "_udp." in domain or "_tcp." in domain:
+        return True
+
+    # Empty / malformed
+    if domain == "unknown" or len(domain) < 4:
+        return True
+
+    # IP literals or host:port should not be treated as suspicious DNS domains.
+    host = domain
+    if ":" in host and host.count(":") == 1:
+        left, right = host.rsplit(":", 1)
+        if right.isdigit():
+            host = left
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+
+    return False
 
 class WebsiteAnalyzer:
     def __init__(self):
@@ -33,6 +71,8 @@ class WebsiteAnalyzer:
         Analyzes a domain for suspicious patterns.
         Returns (threat_score, reasons)
         """
+        if is_noise_domain(domain):
+            return 0, []
         domain_lower = domain.lower()
         if any(white in domain_lower for white in WHITELIST):
             return 0, []
