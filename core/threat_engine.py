@@ -170,6 +170,10 @@ class IPThreatState:
         self.block_reason = ""
         self.last_confidence = 0.0
         self.last_reasoning = ""
+        self.last_reasoning_list = []
+        self.last_risk_score = 0
+        self.last_repeat_strong = 0
+        self.last_process_name = "unknown process"
         self._lock = threading.Lock()
 
     def add_score(self, points, reason, alert_type):
@@ -212,6 +216,8 @@ class IPThreatState:
                 "action": self.action,
                 "is_blocked": self.is_blocked,
                 "confidence": round(self.last_confidence, 2),
+                "risk_score": self.last_risk_score,
+                "repeat_strong": self.last_repeat_strong,
                 "reasoning": self.last_reasoning[:400],
                 "evidence_count": len(self.evidence),
                 "evidence": list(self.evidence)[-5:],  # Last 5 pieces
@@ -238,6 +244,18 @@ class ThreatScoringEngine:
         self._action_log = deque(maxlen=500)
         self._behavior = {}   # ip -> IPBehaviorProfile
         self._domain_repeats = defaultdict(lambda: deque(maxlen=50))  # domain -> [timestamps]
+        self._process_cache = {}  # ip -> {"process": str, "ts": float}
+        self._process_cache_lock = threading.Lock()
+        self._process_cache_ttl_sec = 25.0
+
+        # Optional source intelligence caches (async, best-effort; never block).
+        self._domain_cache = {}  # ip -> {"domain": str, "ts": float}
+        self._isp_cache = {}     # ip -> {"isp_org": str, "ts": float}
+        self._intel_cache_lock = threading.Lock()
+        self._domain_inflight = set()
+        self._isp_inflight = set()
+        self._domain_ttl_sec = 6 * 3600
+        self._isp_ttl_sec = 1 * 3600
 
         # Start auto-unblock monitor
         t = threading.Thread(target=self._unblock_monitor, daemon=True)
@@ -256,6 +274,127 @@ class ThreatScoringEngine:
                 b = IPBehaviorProfile(ip)
                 self._behavior[ip] = b
             return b
+
+    def _source_type_from_ip(self, ip: str) -> str:
+        """Backend-only label (never shown as INTERNAL/EXTERNAL)."""
+        try:
+            if ip.startswith(("10.", "192.168.")):
+                return "Local Device"
+            if ip.startswith("172."):
+                parts = ip.split(".")
+                if len(parts) >= 2:
+                    sec = int(parts[1])
+                    if 16 <= sec <= 31:
+                        return "Local Device"
+        except Exception:
+            pass
+        return "External Source"
+
+    def _get_process_for_ip_cached(self, ip: str) -> str:
+        """Best-effort process mapping from in-memory packet store (cached)."""
+        now = time.time()
+        with self._process_cache_lock:
+            ent = self._process_cache.get(ip)
+            if ent and (now - ent.get("ts", 0)) <= self._process_cache_ttl_sec:
+                return ent.get("process") or "unknown process"
+
+        process_name = "unknown process"
+        try:
+            from monitoring.packet_capture import packet_store
+            recent_packets = packet_store.get_recent(n=250) or []
+            for p in reversed(recent_packets):
+                if p.get("src_ip") == ip and p.get("process"):
+                    process_name = p.get("process") or process_name
+                    break
+        except Exception:
+            pass
+
+        with self._process_cache_lock:
+            self._process_cache[ip] = {"process": process_name, "ts": now}
+        return process_name
+
+    def _get_cached_domain_and_isp(self, ip: str) -> tuple:
+        """Return cached (domain, isp_org) without triggering blocking calls."""
+        now = time.time()
+        with self._intel_cache_lock:
+            d_ent = self._domain_cache.get(ip)
+            i_ent = self._isp_cache.get(ip)
+
+            domain = d_ent.get("domain") if d_ent and (now - d_ent.get("ts", 0)) <= self._domain_ttl_sec else None
+            isp_org = i_ent.get("isp_org") if i_ent and (now - i_ent.get("ts", 0)) <= self._isp_ttl_sec else None
+        return (domain or "unknown", isp_org or "unresolved")
+
+    def _schedule_reverse_dns_async(self, ip: str) -> None:
+        """Async reverse DNS lookup with safe fallback."""
+        now = time.time()
+        with self._intel_cache_lock:
+            d_ent = self._domain_cache.get(ip)
+            if d_ent and (now - d_ent.get("ts", 0)) <= self._domain_ttl_sec:
+                return
+            if ip in self._domain_inflight:
+                return
+            self._domain_inflight.add(ip)
+
+        def _worker():
+            try:
+                import socket as _socket
+                # Prevent hanging: short timeout during lookup
+                orig_timeout = None
+                try:
+                    orig_timeout = _socket.getdefaulttimeout()
+                except Exception:
+                    orig_timeout = None
+                try:
+                    _socket.setdefaulttimeout(2.0)
+                    domain = _socket.gethostbyaddr(ip)[0]
+                finally:
+                    try:
+                        _socket.setdefaulttimeout(orig_timeout)
+                    except Exception:
+                        pass
+            except Exception:
+                domain = "unknown"
+
+            with self._intel_cache_lock:
+                self._domain_cache[ip] = {"domain": domain, "ts": time.time()}
+                self._domain_inflight.discard(ip)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _schedule_isp_org_async(self, ip: str) -> None:
+        """Async ISP/org enrichment via ip-api.com (best-effort)."""
+        now = time.time()
+        with self._intel_cache_lock:
+            i_ent = self._isp_cache.get(ip)
+            if i_ent and (now - i_ent.get("ts", 0)) <= self._isp_ttl_sec:
+                return
+            if ip in self._isp_inflight:
+                return
+            self._isp_inflight.add(ip)
+
+        def _worker():
+            isp_org = "unresolved"
+            try:
+                import urllib.request as _urllib_request
+                import json as _json
+                url = f"http://ip-api.com/json/{ip}?fields=status,isp,org"
+                req = _urllib_request.Request(url, headers={"User-Agent": "AutonomousCyberDefence/1.0"})
+                with _urllib_request.urlopen(req, timeout=2.5) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                data = _json.loads(raw) if raw else {}
+                if data.get("status") == "success":
+                    isp = data.get("isp") or ""
+                    org = data.get("org") or ""
+                    val = (isp if isp else org).strip()
+                    isp_org = val if val else "unresolved"
+            except Exception:
+                isp_org = "unresolved"
+
+            with self._intel_cache_lock:
+                self._isp_cache[ip] = {"isp_org": isp_org, "ts": time.time()}
+                self._isp_inflight.discard(ip)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _detect_patterns(self, ip: str, behavior_snap: dict, profile, alert: dict) -> list:
         """
@@ -342,6 +481,87 @@ class ThreatScoringEngine:
         confidence = (0.35 * ml_norm) + (0.25 * dev_norm) + (0.40 * rep_norm)
         return _clamp01(confidence)
 
+    # ─── Production Decision Model (Safety-biased, explainable) ───────────────
+    def compute_risk(self, threat: dict, state: "IPThreatState") -> tuple[int, list[str]]:
+        """
+        Compute a risk score (0-100) and explain why.
+
+        Inputs used (as requested):
+        - process
+        - source_type
+        - confidence (state.last_confidence)
+        - behavior score (state.score)
+        """
+        ip = state.ip
+        confidence = float(getattr(state, "last_confidence", 0.0) or 0.0)
+        behavior_score = int(getattr(state, "score", 0) or 0)
+
+        process_name = threat.get("process") or getattr(state, "last_process_name", None) or self._get_process_for_ip_cached(ip)
+        process_lower = (process_name or "unknown process").lower()
+        unknown_process = ("unknown" in process_lower) or not process_lower.strip()
+
+        source_type = self._source_type_from_ip(ip)  # Local Device / External Source
+
+        risk = 0
+        reasons: list[str] = []
+
+        # Positive signals (weights as requested)
+        if confidence > 0.75:
+            risk += 40
+            reasons.append(f"ML confidence high ({confidence:.2f} > 0.75): +40")
+        if behavior_score >= 50:  # behavior_score is capped at 50 in this system
+            risk += 20
+            reasons.append(f"Behavior score high ({behavior_score} >= 50): +20")
+        if source_type == "External Source":
+            risk += 10
+            reasons.append("External source: +10")
+        if unknown_process:
+            risk += 20
+            reasons.append("Unknown process: +20")
+
+        # Protection (as requested)
+        trusted_processes = {
+            "chrome.exe", "msedge.exe", "edge.exe", "explorer.exe",
+            "whatsapp.exe", "teams.exe", "outlook.exe",
+            "svchost.exe", "system", "winlogon.exe", "services.exe"
+        }
+        is_trusted_process = process_lower in trusted_processes
+
+        if is_trusted_process:
+            risk -= 30
+            reasons.append(f"Trusted process ({process_name}): -30")
+        if source_type == "Local Device":
+            risk -= 20
+            reasons.append("Local traffic: -20")
+
+        risk = max(0, min(100, int(risk)))
+        return risk, reasons
+
+    def decide(self, risk: int, state: "IPThreatState") -> str:
+        """
+        Decide action based on risk + repetition + confidence.
+
+        Returns one of: ALLOW, MONITOR, ALERT, BLOCK
+        """
+        repeat_strong = int(getattr(state, "last_repeat_strong", 0) or 0)
+        confidence = float(getattr(state, "last_confidence", 0.0) or 0.0)
+
+        # Safety rule: no blocking on low repetition
+        if repeat_strong < 2:
+            return "MONITOR"
+
+        if risk < 30:
+            return "ALLOW"
+        if risk < 60:
+            return "MONITOR"
+        if risk < 80:
+            return "ALERT"
+
+        # risk >= 80: only block if repeated + high confidence
+        if repeat_strong >= 3 and confidence > 0.8:
+            return "BLOCK"
+        return "ALERT"
+
     def process_alert(self, alert, profile=None):
         """
         Process an alert from the traffic analyzer.
@@ -407,6 +627,11 @@ class ThreatScoringEngine:
         # Log to database
         try:
             from data.database import log_event, log_action, block_entity_db
+            process_name = getattr(state, "last_process_name", None) or alert.get("process") or "unknown process"
+            reasoning_str = getattr(state, "last_reasoning", "") or ""
+            reasoning_list = getattr(state, "last_reasoning_list", []) or []
+            repeat_count = int(getattr(state, "last_repeat_strong", 0) or 0)
+            risk_score = int(getattr(state, "last_risk_score", state.score) or 0)
             log_event(
                 src_ip=ip,
                 dest_ip=alert.get("dst_ip", "LOCAL"),
@@ -421,7 +646,13 @@ class ThreatScoringEngine:
                     "threat_level": state.get_threat_level(),
                     "alert_type": alert_type,
                     "action": action,
-                    "detail": detail
+                    "process": process_name,
+                    "event": alert_type,
+                    "risk_score": risk_score,
+                    "confidence": state.last_confidence,
+                    "repeat_count": repeat_count,
+                    "reasoning": reasoning_list,
+                    "detail": f"{detail} | WHY: {reasoning_str}" if reasoning_str else detail
                 },
                 threat_score=state.score
             )
@@ -532,36 +763,39 @@ class ThreatScoringEngine:
         # - single anomaly => never block
         # - temporary spike => monitor/alert first (require repetition)
         # - require ML + abnormal pattern + repetition + not whitelisted (whitelist enforced in _execute_block)
-        can_consider_block = (
-            has_recent_ml and
-            len(patterns) >= 1 and
-            repeat_strong >= 2 and
-            evidence_count >= 3
+        # Persist repetition count for the decision model.
+        try:
+            state.last_repeat_strong = int(repeat_strong)
+        except Exception:
+            state.last_repeat_strong = 0
+
+        # Resolve process and persist it for explainable logging.
+        process_name = alert.get("process") or self._get_process_for_ip_cached(ip)
+        state.last_process_name = process_name or "unknown process"
+
+        # Risk + decision (production-level, safety-biased).
+        risk, risk_reasons = self.compute_risk(alert, state)
+        decision = self.decide(risk, state)
+
+        # Combine explainability (baseline patterns + risk factors + final decision).
+        final_reasoning_list = list(reasoning_lines)
+        final_reasoning_list.extend(risk_reasons)
+        final_reasoning_list.append(
+            f"Decision={decision} (risk={risk}, repeat_strong={repeat_strong}, confidence={confidence:.2f})"
         )
 
-        if score >= 11 and evidence_count >= 3 and can_consider_block and confidence >= 0.80:
-            action = "BLOCK"
-            reason = "Blocked because:\n- " + "\n- ".join(reasoning_lines)
-            self._execute_block(ip, state, reason, permanent=True)
+        # Persist explainable outputs for log_event() in process_alert().
+        state.last_risk_score = int(risk)
+        state.last_reasoning_list = final_reasoning_list
+        state.last_reasoning = " | ".join(final_reasoning_list)
 
-        elif score >= 7 and evidence_count >= 2:
-            action = "TEMP_BLOCK"
-            # TEMP_BLOCK is still a block; keep it ultra-safe (prefer ALERT/LOG unless very confident)
-            if can_consider_block and confidence >= 0.85:
-                reason = "Temp-blocked because:\n- " + "\n- ".join(reasoning_lines)
-                self._execute_block(ip, state, reason, permanent=False)
-            else:
-                action = "LOG"
-                state.action = action
-                self._action_log.append({
-                    "timestamp": datetime.now().isoformat(),
-                    "ip": ip,
-                    "action": action,
-                    "score": score,
-                    "reason": "Alerted/Logged because (safe mode): " + " | ".join(reasoning_lines[:4]),
-                })
+        # Map decision to existing action semantics.
+        if decision == "ALLOW" or decision == "MONITOR":
+            action = "MONITOR"
+            state.action = action
+            return action
 
-        elif score >= 4:
+        if decision == "ALERT":
             action = "LOG"
             state.action = action
             self._action_log.append({
@@ -569,14 +803,20 @@ class ThreatScoringEngine:
                 "ip": ip,
                 "action": action,
                 "score": score,
-                "reason": "Suspicious activity: " + " | ".join(reasoning_lines[:4]),
+                "reason": "ALERT: " + " | ".join(final_reasoning_list[:6]),
             })
+            return action
 
-        elif score == 0:
-            action = "MONITOR"
-            state.action = action
+        # decision == "BLOCK": Safe blocking (TEMP_BLOCK only, repetition-confirmed by decide()).
+        if decision == "BLOCK":
+            action = "TEMP_BLOCK"
+            reason = "Blocked because:\n- " + "\n- ".join(final_reasoning_list)
+            self._execute_block(ip, state, reason, permanent=False)
+            return "TEMP_BLOCK"
 
-        return action
+        # Defensive fallback (should never happen).
+        state.action = "MONITOR"
+        return "MONITOR"
 
     def _execute_block(self, ip, state, reason, permanent=False):
         """Execute firewall block and update state."""
@@ -621,9 +861,46 @@ class ThreatScoringEngine:
         try:
             from data.database import log_action, block_entity_db
             from defense.firewall import block_ip
+            # Also log a structured event so the dashboard "Events Feed" updates.
+            from monitoring.packet_capture import packet_store
+            process_name = "unknown process"
+            try:
+                recent_packets = packet_store.get_recent(n=300) or []
+                for p in reversed(recent_packets):
+                    if p.get("src_ip") == ip and p.get("process"):
+                        process_name = p.get("process") or process_name
+                        break
+            except Exception:
+                pass
+
             block_entity_db("IP", ip, reason[:200])
             log_action("IP", ip, state.action, reason[:200])
             block_ip(ip)
+
+            # Critical: blocking must always trigger an events-table write.
+            from data.database import log_event
+            log_event(
+                src_ip=ip,
+                dest_ip="LOCAL",
+                src_port=0,
+                dst_port=0,
+                protocol="DEFENSE",
+                payload_size=0,
+                severity=state.get_severity(),
+                anomaly_score=min(state.score / 10.0, 1.0),
+                active_window="BLOCK",
+                details={
+                    "event": "BLOCK",
+                    "action": state.action,
+                    "risk_score": int(getattr(state, "last_risk_score", state.score) or state.score),
+                    "confidence": float(getattr(state, "last_confidence", 0.0) or 0.0),
+                    "repeat_count": int(getattr(state, "last_repeat_strong", 0) or 0),
+                    "reasoning": getattr(state, "last_reasoning_list", []) or [],
+                    "process": process_name,
+                    "detail": reason
+                },
+                threat_score=state.score
+            )
         except Exception as e:
             print(f"[ThreatEngine] Block error: {e}")
 
