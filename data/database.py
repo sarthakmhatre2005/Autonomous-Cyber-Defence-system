@@ -404,6 +404,9 @@ def get_stats():
         c.execute("SELECT COUNT(*) FROM blocked_entities WHERE active=1")
         blocked = c.fetchone()[0]
         
+        c.execute("SELECT COUNT(*) FROM honeypot_events")
+        honeypot_hits = c.fetchone()[0]
+        
         # Threat engine stats
         try:
             from core.threat_engine import threat_engine
@@ -415,6 +418,7 @@ def get_stats():
             "total_requests": total_requests, 
             "anomalies": anomalies, 
             "blocked": blocked,
+            "honeypot_hits": honeypot_hits,
             "external_ips_tracked": te_stats.get("total_ips_tracked", 0),
             "high_threat_ips": te_stats.get("high_threat_ips", 0),
             "suspicious_ips": te_stats.get("suspicious_ips", 0),
@@ -475,6 +479,16 @@ def get_dns_history(limit=100):
         conn.close()
         return [dict(row) for row in rows]
     except: return []
+
+def log_threat_event(ip, ip_type, event_type, score_delta, cumulative_score, severity, detail):
+    def _write(conn, ip, ip_type, event_type, score_delta, cumulative_score, severity, detail):
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO threat_events (timestamp, source_ip, ip_type, event_type, score_delta, cumulative_score, severity, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.now().isoformat(), ip, ip_type, event_type, score_delta, cumulative_score, severity, detail)
+        )
+    db_logger.submit(_write, ip, ip_type, event_type, score_delta, cumulative_score, severity, detail)
 
 def log_honeypot_event(ip, port, honeypot_port, data):
     def _write(conn, ip, port, honeypot_port, data):

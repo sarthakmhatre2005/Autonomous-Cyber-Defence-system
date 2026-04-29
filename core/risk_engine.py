@@ -122,43 +122,20 @@ class RiskEngine:
         ml_anomaly_strong = anomaly_ratio > 0.9
         honeypot_hit = str(alert.get("type") or "") == "HONEYPOT_HIT"
 
+        if honeypot_hit:
+            risk = 100
+            reasons = ["Honeypot interaction detected: unauthorized access attempt"]
+            attack_type = "HONEYPOT_HIT"
+            return risk, reasons, attack_type
+
         alert_type_u = str(alert.get("type") or "").upper()
         spike_only = bool(alert.get("spike_only")) and alert_type_u == "CONNECTION_BURST"
 
-        # Isolated connection spike: small risk bump only (no +40/+50 style escalation).
         if spike_only:
-            bump = 7
-            if repeat_strong >= 2:
-                bump = min(18, 10 + repeat_strong * 2)
-            if ml_anomaly_strong:
-                bump = min(25, bump + 10)
-            risk = risk_prev + bump
-            reasons = [
-                f"connection_spike_only=+{bump} (capped; corroboration={'yes' if (repeat_strong >= 2 or ml_anomaly_strong) else 'no'})",
-            ]
-            # Still apply memory for repeat offenders, lightly
-            mem = ip_memory.get(ip, {}) or {}
-            past_blocks = int(mem.get("past_blocks", 0) or 0)
-            if past_blocks >= 1:
-                mem_add = min(12, 4 * past_blocks)
-                risk += mem_add
-                reasons.append(f"memory_add=+{mem_add} (past_blocks={past_blocks})")
-            proc_lower = (process_name or "").lower()
-            trusted_processes = {"chrome.exe", "msedge.exe", "whatsapp.exe", "system"}
-            if proc_lower in trusted_processes:
-                risk -= 8
-                reasons.append("process_trust_penalty=-8")
-            try:
-                from core.cloud_intel import is_likely_cloud_or_cdn
-
-                if is_likely_cloud_or_cdn(ip) and repeat_strong < 2 and not ml_anomaly_strong:
-                    risk -= 15
-                    reasons.append("cloud_cdn_benign_hint=-15")
-            except Exception:
-                pass
-            risk = max(0, min(100, int(risk)))
-            attack_type = "CONNECTION_SPIKE"
-            return risk, reasons, attack_type
+            # Isolated connection spike: minimal risk, no block.
+            risk = max(5, risk_prev + 5)
+            reasons = ["Isolated traffic spike detected (non-malicious context)"]
+            return risk, reasons, "CONNECTION_SPIKE"
 
         # --- Base increment (continuous accumulation) ---
         base_increment = 5
@@ -168,74 +145,56 @@ class RiskEngine:
             base_increment = 3
 
         risk = risk_prev + base_increment
-        reasons = [f"base_increment=+{base_increment} (source={source_type})"]
+        reasons = []
+        if source_type in ("SYSTEM", "LOCAL_DEVICE"):
+             reasons.append(f"Connection from {source_type.lower()} source")
 
         # --- Early escalation: rapid first attempts ---
-        if attempts_in_5s >= 3:
-            early_boost = 20
+        if attempts_in_5s >= 5:
+            early_boost = 15
             risk += early_boost
-            reasons.append(f"early_boost=+{early_boost} (>=3 events/5s: {attempts_in_5s})")
+            reasons.append(f"High frequency of events ({attempts_in_5s} in 5s)")
 
         # --- Strong signal override ---
         if ml_anomaly_strong:
-            large_boost = 25
+            large_boost = 20
             risk += large_boost
-            reasons.append(f"strong_ml_boost=+{large_boost} (anomaly_ratio={anomaly_ratio:.2f})")
+            reasons.append(f"Behavioral profile mismatch (Anomaly Score: {anomaly_ratio:.2f})")
         if honeypot_hit:
-            large_boost = 35
+            large_boost = 40
             risk += large_boost
-            reasons.append(f"honeypot_boost=+{large_boost}")
+            reasons.append("Unauthorized access to restricted resource (Honeypot hit)")
 
         # --- Repetition: multiply when repeated pattern appears ---
         # This is intentionally multiplicative to avoid hard thresholds.
         if repeat_strong >= 2 and (port_scan or burst or honeypot_hit):
             risk = int(risk * 1.2)
-            reasons.append("repeat_multiplier=×1.2 (repeat_strong>=2 and suspicious pattern)")
+            reasons.append("Pattern persistence detected")
         if repeat_strong >= 3:
             risk = int(risk * 1.2)
-            reasons.append("repeat_multiplier=×1.2 (repeat_strong>=3)")
+            reasons.append("Multiple repeated behavioral anomalies")
 
         # --- Conditional correlation boosts ---
         if port_scan and burst:
-            high_boost = 15
-            risk += high_boost
-            reasons.append(f"conditional_correlation=+{high_boost} (port_scan AND burst)")
+            risk += 15
+            reasons.append("Combined port scanning and high traffic volume detected")
 
         proc_l = (process_name or "").lower()
-        unknown_process = (not process_name) or (
-            "unknown" in proc_l and "external traffic" not in proc_l
-        )
-        if (ml_anomaly_strong or confidence >= 0.75) and unknown_process:
-            high_boost = 15
-            risk += high_boost
-            reasons.append(f"conditional_correlation=+{high_boost} (anomaly AND unknown_process)")
+        if (ml_anomaly_strong or confidence >= 0.85) and not process_name:
+            risk += 10
+            reasons.append("Strong anomaly from unidentifiable process")
 
         # --- Memory-based persistence ---
         mem = ip_memory.get(ip, {}) or {}
         past_blocks = int(mem.get("past_blocks", 0) or 0)
         total_flags = int(mem.get("total_flags", 0) or 0)
+
         if past_blocks >= 1:
-            mem_add = min(20, 5 * past_blocks)
-            risk += mem_add
-            reasons.append(f"memory_add=+{mem_add} (past_blocks={past_blocks})")
-
-        # Escalate faster for repeat offenders by adding fraction of previous risk.
-        if risk_prev > 0:
-            mem_factor = 0.10 + min(0.20, past_blocks * 0.05)
-            mem_risk = int(risk_prev * mem_factor)
-            risk += mem_risk
-            reasons.append(f"memory_prev_risk_add=+{mem_risk} (factor={mem_factor:.2f})")
-
-        if total_flags >= 100:
+            risk += min(15, 5 * past_blocks)
+            reasons.append(f"IP has history of malicious activity ({past_blocks} blocks)")
+        if total_flags >= 50:
             risk += 10
-            reasons.append("memory_total_flags_boost=+10 (total_flags>=100)")
-
-        # --- Local trust override (never blindly trust) ---
-        if source_type in ("SYSTEM", "LOCAL_DEVICE"):
-            # Default reduction is already reflected in base_increment,
-            # but we remove additional reductions if behavior is repeated/suspicious.
-            if repeat_strong >= 2:
-                reasons.append("local_reduction_removed (repeat_strong>=2)")
+            reasons.append(f"IP flagged in {total_flags} prior events")
 
         # Process trust refinement (do not fully eliminate trust)
         trusted_processes = {"chrome.exe", "msedge.exe", "whatsapp.exe", "system"}
@@ -253,9 +212,8 @@ class RiskEngine:
             now=now, alert={**alert, "ip": ip}, confidence=confidence
         )
         if is_coord:
-            global_boost = 10
-            risk += global_boost
-            reasons.append(f"coordinated_global_boost=+{global_boost} (same_port_ips={n_ips})")
+            risk += 10
+            reasons.append("Distributed/Coordinated connection activity detected")
 
         # --- Attack intent mapping for explainability ---
         attack_type = "SUSPICIOUS_BEHAVIOR"

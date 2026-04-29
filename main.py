@@ -6,6 +6,7 @@ from monitoring.process_monitor import start_process_monitor
 from monitoring.persistence_monitor import start_persistence_monitor
 from monitoring.packet_capture import start_packet_capture
 from defense.honeypot import start_honeypot
+from monitoring.dns_monitor import start_dns_monitor
 from dashboard.app import app
 
 def is_admin():
@@ -43,6 +44,9 @@ def main():
     
     start_honeypot()
     print("[+] Deception Honeypot started.")
+
+    start_dns_monitor()
+    print("[+] DNS Cache Monitor started (catches DoH + cached lookups).")
 
     print("\n[+] Background services running. Launching SOC Dashboard...")
     

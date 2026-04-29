@@ -11,8 +11,16 @@ PHISHING_KEYWORDS = [
     "malicious", "virus", "exploit", "hacker", "payload", "c2", "cnc", "botnet"
 ]
 
-# Common safe domains to reduce false positives
-WHITELIST = ["google.com", "bing.com", "github.com", "microsoft.com", "apple.com", "amazon.com", "facebook.com", "twitter.com"]
+# Common safe domains and prefixes to reduce false positives
+# Expanded to include common tech services and CDNs frequently flagged by heuristics.
+WHITELIST = [
+    "google.com", "goog", "googleapis.com", "gstatic.com", "googleusercontent.com",
+    "microsoft.com", "microsoftonline.com", "windows.net", "office.net", "office365.com",
+    "bing.com", "github.com", "apple.com", "icloud.com", "amazon.com", "aws.amazon.com",
+    "facebook.com", "twitter.com", "youtube.com", "ytimg.com", "ggpht.com",
+    "dell.com", "dellcdn.com", "sharepoint.com", "skype.com", "cloudflare.com",
+    "fastly.net", "akamai.net", "digicert.com", "verisign.com", "trustwave.com"
+]
 
 
 def is_noise_domain(domain):
@@ -74,8 +82,11 @@ class WebsiteAnalyzer:
         if is_noise_domain(domain):
             return 0, []
         domain_lower = domain.lower()
-        if any(white in domain_lower for white in WHITELIST):
-            return 0, []
+        
+        # Exact match or subdomain of a whitelisted domain
+        for white in WHITELIST:
+            if domain_lower == white or domain_lower.endswith("." + white):
+                return 0, []
 
         score = 0
         reasons = []
@@ -83,15 +94,18 @@ class WebsiteAnalyzer:
         # 1. Keyword Check
         for kw in PHISHING_KEYWORDS:
             if kw in domain_lower:
-                score += 4 # Increased weight
-                reasons.append(f"Contains keyword: {kw}")
+                # Only flag if it's a suspicious-looking keyword match (not just any substring)
+                # We check if the keyword is preceded or followed by a non-alpha character or is at the boundary
+                if re.search(rf'[^a-zA-Z]{kw}[^a-zA-Z]|^{kw}[^a-zA-Z]|[^a-zA-Z]{kw}$', domain_lower):
+                    score += 4
+                    reasons.append(f"Suspicious keyword: {kw}")
 
         # 2. Randomness Check (Entropy)
-        # Reduced threshold slightly for more aggressive DGA detection
+        # Increased threshold to 4.2. Legitimate domains with long subdomains often hit 3.8-4.0.
         entropy = self.calculate_entropy(domain_lower)
-        if entropy > 3.6:
+        if entropy > 4.2:
             score += 4
-            reasons.append(f"High randomness (Entropy: {entropy:.2f})")
+            reasons.append(f"DGA candidate (Entropy: {entropy:.2f})")
 
         # 3. Structural Heuristics
         # IP Address in domain
@@ -100,18 +114,18 @@ class WebsiteAnalyzer:
             reasons.append("IP address in domain")
 
         # Long domains
-        if len(domain) > 40: # Lowered from 50
+        if len(domain) > 60: # Increased from 40 to accommodate corporate subdomains
             score += 2
             reasons.append("Excessive length")
 
         # Excessive numbers
         num_count = sum(c.isdigit() for c in domain)
-        if num_count > 4: # Lowered from 5
+        if num_count > 8: # Increased from 4
             score += 3
             reasons.append(f"High number count ({num_count})")
 
         # Excessive hyphens
-        if domain.count('-') > 2:
+        if domain.count('-') > 4: # Increased from 2
             score += 2
             reasons.append(f"Excessive hyphens ({domain.count('-')})")
 

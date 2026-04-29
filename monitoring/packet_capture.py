@@ -68,19 +68,9 @@ def get_all_local_ips():
     except:
         pass
     
-    # Try to add default gateway
-    try:
-        # On Windows, this is a bit tricky without extra libs, 
-        # but we can infer it from 'route print' or common patterns.
-        # Simple heuristic: if we know our IP and it's 192.168.x.y, 
-        # 192.168.x.1 is often the gateway.
-        for ip in list(ips):
-            if ip.startswith("192.168.") or ip.startswith("10."):
-                parts = ip.split('.')
-                gateway = f"{parts[0]}.{parts[1]}.{parts[2]}.1"
-                ips.add(gateway)
-    except:
-        pass
+    # We NO LONGER add the gateway here. 
+    # This allows the system to block the gateway if it's the source of a scan.
+    # We only protect the actual machine IPs.
     return ips
 
 # Global set of protected IPs
@@ -235,44 +225,50 @@ def handle_packet(pkt):
     """
     global _traffic_analyzer_cached
     try:
-        if not pkt.haslayer(IP):
+        ip_layer = pkt.payload if hasattr(pkt, 'payload') else pkt.getlayer(IP)
+        if ip_layer is None or not hasattr(ip_layer, 'proto'):
             return
 
-        ip_layer = pkt[IP]
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
+        src_ip = getattr(ip_layer, 'src', '')
+        dst_ip = getattr(ip_layer, 'dst', '')
 
         # Minimal metadata for the queue
         meta = {
             "timestamp": time.time(),
-            "datetime": datetime.now().isoformat(),
+            "datetime": "", # deferred formatting
             "src_ip": src_ip,
             "dst_ip": dst_ip,
+            "src_port": 0,
+            "dst_port": 0,
             "protocol": "OTHER",
-            "payload_size": ip_layer.len,
-            "source": "scapy"
+            "payload_size": getattr(ip_layer, 'len', 0),
+            "source": "scapy",
+            "is_dns": False
         }
 
-        # Pass protocol and ports for the worker to correlate with processes
-        if pkt.haslayer(TCP):
-            tcp = pkt[TCP]
-            meta["protocol"] = "TCP"
-            meta["dst_port"] = tcp.dport
-            meta["src_port"] = tcp.sport
-        elif pkt.haslayer(UDP):
-            meta["protocol"] = "UDP"
-            meta["dst_port"] = pkt[UDP].dport
-            meta["src_port"] = pkt[UDP].sport
-        elif pkt.haslayer(ICMP):
-            meta["protocol"] = "ICMP"
+        # Fast protocol extraction (avoid haslayer and slow indexing)
+        proto = ip_layer.proto
+        transport = ip_layer.payload
         
-        # New: Defer deep inspection (DNS) to worker
-        if pkt.haslayer(DNS):
-            meta["has_dns"] = True
-            if pkt.haslayer(DNSQR):
-                # Only pass the raw qname object, don't decode here (CPU expensive)
-                try: meta["_dns_raw_qname"] = pkt[DNSQR].qname 
-                except: pass
+        # IMMEDIATELY INCREMENT FAST COUNTER
+        packet_store.total_captured += 1
+
+        if proto == 6 and hasattr(transport, 'sport'):  # TCP
+            meta["protocol"] = "TCP"
+            meta["src_port"] = int(transport.sport)
+            meta["dst_port"] = int(transport.dport)
+        elif proto == 17 and hasattr(transport, 'sport'): # UDP
+            meta["protocol"] = "UDP"
+            meta["src_port"] = int(transport.sport)
+            meta["dst_port"] = int(transport.dport)
+            if transport.sport == 53 or transport.dport == 53:
+                meta["is_dns"] = True
+                meta["has_dns"] = True
+                if hasattr(pkt, 'haslayer') and pkt.haslayer(DNSQR):
+                    try: meta["_dns_raw_qname"] = pkt[DNSQR].qname
+                    except: pass
+        elif proto == 1: # ICMP
+            meta["protocol"] = "ICMP"
 
         # Capture all packets here; loopback / noise filtering happens in the analyzer (not at capture).
 
@@ -348,7 +344,6 @@ def start_scapy_capture():
     # Exclude port 53 (DNS) if we want to focus on data, but let's keep it and just exclude 5000.
     bpffilter = "ip and not port 5000"
     
-    # If no specific interface found, use None to sniff on all active interfaces
     if iface is None:
         print("[PacketCapture] No specific active interface found. Sniffing on ALL interfaces.")
     else:
@@ -356,7 +351,6 @@ def start_scapy_capture():
 
     try:
         # Optimization: use store=False to avoid memory bloat
-        # count=0 means infinity
         sniff(filter=bpffilter, prn=handle_packet, store=False, iface=iface, count=0)
     except Exception as e:
         print(f"[PacketCapture] Scapy capture error: {e}")

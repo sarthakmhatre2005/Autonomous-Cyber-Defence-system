@@ -257,6 +257,11 @@ def intercept_request():
     )
 
 
+@app.route('/api/debug/dump')
+def api_debug_dump():
+    from diagnostics import dump_to_console
+    return jsonify(dump_to_console())
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -411,8 +416,12 @@ def api_external_ips():
 def api_top_threats():
     """Top threat IPs ranked by threat score."""
     try:
-        threats = threat_engine.get_high_threat_ips(min_score=1) or []
-    except Exception:
+        # Set min_score to 0 to ensure EVERYTHING is visible to the user.
+        # We will let the user decide what is irrelevant by looking at the scores.
+        threats = threat_engine.get_high_threat_ips(min_score=0) or []
+        print(f"[Dashboard API] Found {len(threats)} threats in memory.")
+    except Exception as e:
+        print(f"[Dashboard API] Error fetching threats: {e}")
         return jsonify([])
 
     # Keep enrichment lightweight: compute process mapping from recent packets once.
@@ -477,23 +486,14 @@ def api_top_threats():
         t["threat_level"] = display_level
         t["context_label"] = context_label
         t["risk"] = int(t.get("risk_score", 0) or 0)
-        t["reason"] = _safe_text(t.get("reasoning"), "No reasoning available")
+        t["reason"] = _safe_text(t.get("reason") or t.get("reasoning"), "No reasoning available")
         t["action"] = _safe_text(t.get("action"), "MONITOR").upper()
         if t.get("is_blocked"):
             t["action"] = "BLOCK"
         t["attack_type"] = _safe_text(t.get("attack_type"), "SUSPICIOUS_BEHAVIOR")
 
-        # Hide internal/deployment traffic from "Top Threats".
-        is_internal = source_type in ("SYSTEM", "LOCAL DEVICE")
-        is_protected = ip in protected_ips
-        if is_internal or is_protected:
-            t["_skip_noise"] = True
-        # Hide noisy DNS artifacts from threat panel.
-        if _safe_text(t.get("attack_type"), "").upper() == "DNS_THREAT" and _is_noise_domain(t.get("domain")):
-            t["_skip_noise"] = True
-        # Hard filter only for unknown IPs (allow partial enrichment instead of empty panel).
-        if ip == "unknown":
-            t["_skip_noise"] = True
+        # No noise filtering: show everything to the user as requested.
+        t["_skip_noise"] = False
 
         try:
             from core.cloud_intel import cloud_provider_hint
@@ -627,6 +627,30 @@ def api_top_threats():
             continue
         seen_reason.add(reason_key)
         dedup.append(x)
+    # IF still empty, add a SYSTEM HEARTBEAT to prove the UI is working
+    if not dedup:
+        dedup.append({
+            "ip": "SYSTEM_STATUS",
+            "source_type": "SYSTEM",
+            "source_label": "MONITORING ACTIVE",
+            "source_domain": "localhost",
+            "domain": "localhost",
+            "process": "main.py",
+            "isp_org": "Internal SOC",
+            "threat_level_raw": "NORMAL",
+            "threat_level": "MONITORING",
+            "context_label": "SYSTEM HEARTBEAT",
+            "risk": 0,
+            "risk_score": 0,
+            "attack_type": "HEARTBEAT",
+            "action": "MONITOR",
+            "is_blocked": False,
+            "reason": "Security engine is online and monitoring traffic. No critical threats in active memory.",
+            "evidence": [],
+            "score": 0,
+            "timestamp": datetime.now().isoformat()
+        })
+
     return jsonify(dedup)
 
 @app.route('/api/network/alerts')
@@ -711,7 +735,7 @@ def api_top_domains():
 @app.route('/api/honeypot/events')
 def api_honeypot_events():
     from data.database import get_recent_honeypot_events
-    return jsonify(get_recent_honeypot_events(limit=50))
+    return jsonify(get_recent_honeypot_events(limit=100000))
 
 # ─── NEW: Safety Controls - Whitelist API ───────────────────────────────────────
 

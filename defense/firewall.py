@@ -17,7 +17,8 @@ def block_ip(ip):
         print(f"Skipping IP block for {ip} (Not Windows)")
         return True
 
-    rule_name = f"Block_{ip}"
+    rule_name_in = f"Block_In_{ip}"
+    rule_name_out = f"Block_Out_{ip}"
     
     # SAFETY: Do not block localhost/127.0.0.1 during testing to avoid locking user out of dashboard
     if ip in ["127.0.0.1", "::1", "localhost"]:
@@ -28,13 +29,27 @@ def block_ip(ip):
         print(f"[ERROR] Failed to block IP {ip}: Administrator privileges required. Please run as Administrator.")
         return False
 
-    cmd = f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=block remoteip={ip}"
+    # Block Inbound
+    cmd_in = f"netsh advfirewall firewall add rule name=\"{rule_name_in}\" dir=in action=block remoteip={ip}"
+    # Block Outbound
+    cmd_out = f"netsh advfirewall firewall add rule name=\"{rule_name_out}\" dir=out action=block remoteip={ip}"
+    
     try:
-        subprocess.run(cmd, shell=True, check=True, capture_output=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode().strip() if e.stderr else str(e)
-        print(f"Failed to block IP {ip}: {error_msg}")
+        res_in = subprocess.run(cmd_in, shell=True, capture_output=True, text=True)
+        res_out = subprocess.run(cmd_out, shell=True, capture_output=True, text=True)
+        
+        ok_in = (res_in.returncode == 0) or ("already exists" in res_in.stderr.lower())
+        ok_out = (res_out.returncode == 0) or ("already exists" in res_out.stderr.lower())
+        
+        if ok_in and ok_out:
+            print(f"[Firewall] Successfully blocked {ip} (Inbound + Outbound)")
+            return True
+        else:
+            err = res_in.stderr if res_in.returncode != 0 else res_out.stderr
+            print(f"[Firewall] Failed to block IP {ip}: {err.strip()}")
+            return False
+    except Exception as e:
+        print(f"[Firewall] Critical error executing firewall command: {e}")
         return False
 
 def unblock_ip(ip):
@@ -46,15 +61,16 @@ def unblock_ip(ip):
         print(f"[ERROR] Failed to unblock IP {ip}: Administrator privileges required.")
         return
 
-    rule_name = f"Block_{ip}"
-    cmd = f"netsh advfirewall firewall delete rule name=\"{rule_name}\""
+    rule_name_in = f"Block_In_{ip}"
+    rule_name_out = f"Block_Out_{ip}"
+    cmd_in = f"netsh advfirewall firewall delete rule name=\"{rule_name_in}\""
+    cmd_out = f"netsh advfirewall firewall delete rule name=\"{rule_name_out}\""
     try:
-        subprocess.run(cmd, shell=True, check=True, capture_output=True)
-        print(f"Unblocked IP: {ip}")
-    except subprocess.CalledProcessError as e:
-        # Ignore if rule doesn't exist, but report permission issues
-        if "requires elevation" in str(e.stderr):
-            print(f"[ERROR] Failed to unblock IP {ip}: Administrator privileges required.")
+        subprocess.run(cmd_in, shell=True, check=True, capture_output=True)
+        subprocess.run(cmd_out, shell=True, check=True, capture_output=True)
+        print(f"Unblocked IP: {ip} (Inbound + Outbound)")
+    except subprocess.CalledProcessError:
+        pass
 
 def block_domain(domain):
     """Blocks a domain by modifying the hosts file to redirect to localhost. Returns True on success."""

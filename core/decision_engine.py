@@ -59,41 +59,40 @@ def progressive_decide_action(
     threat_level: str = "",
 ) -> str:
     """
-    Safety-biased progressive escalation.
+    Threshold-based escalation. CRITICAL always blocks. No exceptions.
 
     Returns one of: MONITOR | LOG | BLOCK
-    Mandatory BLOCK when risk >= 90 or threat_level is CRITICAL (unless whitelisted at execution).
     """
     source_type = (source_type or "").upper().strip()
-
     thr = (threat_level or "").upper().strip()
+    atk = (attack_type or "").upper().strip()
 
-    # Critical override (except whitelist checks in execution layer).
-    if risk >= 90 or thr == "CRITICAL":
+    # Honeypot hit = always block, no questions asked
+    if atk == "HONEYPOT_HIT":
         return "BLOCK"
 
-    # Internal safety rule: do not block internal unless extremely high risk.
-    if source_type in ("SYSTEM", "LOCAL_DEVICE") and risk < 80:
-        return "MONITOR"
+    # CRITICAL threat level = always block
+    if thr == "CRITICAL" or risk >= 90:
+        return "BLOCK"
 
-    # Single strong signals should be visible early.
-    if risk < 60:
-        if (attack_type or "") == "HONEYPOT_HIT":
+    # MALICIOUS = block (with minimal corroboration for external sources)
+    if thr == "MALICIOUS" or risk >= 70:
+        if source_type in ("SYSTEM", "LOCAL_DEVICE") and risk < 85:
             return "LOG"
-        # Single strong ML anomalies should be visible immediately.
-        if (attack_type or "") == "SUSPICIOUS_BEHAVIOR":
-            return "LOG"
-        return "MONITOR"
+        return "BLOCK"
 
-    # Moderate-high risk: log / monitor.
-    if risk < 80:
+    # HIGH risk = block external, log internal
+    if risk >= 50:
+        if source_type in ("SYSTEM", "LOCAL_DEVICE"):
+            return "LOG"
+        return "BLOCK"
+
+    # SUSPICIOUS = log
+    if risk >= 30 or thr == "SUSPICIOUS":
         return "LOG"
 
-    # Very high risk: require strong confirmation.
-    if repeat_strong >= 3 and confidence > 0.8:
-        return "BLOCK"
-
-    return "LOG"
+    # Low risk = monitor
+    return "MONITOR"
 
 def evaluate_event(event):
     """
@@ -130,10 +129,37 @@ def evaluate_event(event):
              # Here we just log the decision.
              log_action("IP", ip, action, "Severity is MEDIUM. Rate limiting applied.")
 
-    elif severity == "HIGH":
+    elif severity == "HIGH" or severity == "CRITICAL":
         action = "BLOCK"
+        # Real Blocking: Network Level (Inbound + Outbound)
         block_ip(ip)
-        block_entity_db("IP", ip, "Severity is HIGH.")
-        log_action("IP", ip, action, "Severity is HIGH. Immediate Block.")
+        
+        # Real Blocking: Application Level
+        # Find process associated with this IP and terminate it
+        try:
+            from monitoring.packet_capture import packet_store
+            recent = packet_store.get_recent(n=500)
+            target_pid = None
+            target_process = None
+            for p in reversed(recent):
+                if p.get("src_ip") == ip or p.get("dst_ip") == ip:
+                    if p.get("pid"):
+                        target_pid = p.get("pid")
+                        target_process = p.get("process")
+                        break
+            
+            if target_pid:
+                print(f"[DecisionEngine] Terminating malicious process: {target_process} (PID: {target_pid})")
+                try:
+                    p = psutil.Process(target_pid)
+                    p.terminate()
+                    log_action("PROCESS", target_process, "TERMINATE", f"Terminated due to high risk activity from {ip}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            print(f"[DecisionEngine] Error in application level blocking: {e}")
+
+        block_entity_db("IP", ip, reason)
+        log_action("IP", ip, action, f"Real-time block applied. Reason: {reason}")
 
     return action

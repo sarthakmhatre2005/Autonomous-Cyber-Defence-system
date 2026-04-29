@@ -586,8 +586,7 @@ async function fetchThreats() {
       const reasonVal = normalizeText(s.reason || s.reasoning, 'No reasoning available');
       // Hard guard: do not render incomplete noisy cards.
       if (threatIp === 'unknown') return;
-      // Never render internal/deployment activity in Top Threats cards.
-      if (srcType.includes('SYSTEM') || srcType.includes('LOCAL DEVICE')) return;
+      // No filtering: show all threats
       const srcLine = `${threatIp} | ${srcType} | ${proc} | ${domain}${isp ? ' | ' + isp : ''} | Risk: ${riskVal} | Action: ${actionVal}`;
       const srcBadgeCls = srcType.includes('LOCAL') ? 'badge-internal' :
         (srcType.includes('EXTERNAL') ? 'badge-external' : 'badge-monitor');
@@ -980,7 +979,9 @@ async function fetchHoneypotEvents() {
         if (!tbody) return;
         tbody.innerHTML = '';
         
-        document.getElementById('kpi-honeypot-hits').textContent = data.length;
+        const resStats = await fetch('/api/stats');
+        const statsData = await resStats.json();
+        document.getElementById('kpi-honeypot-hits').textContent = statsData.honeypot_hits || data.length;
 
         data.forEach(ev => {
             const tr = document.createElement('tr');

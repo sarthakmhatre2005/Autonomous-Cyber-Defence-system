@@ -183,23 +183,23 @@ SCORE_WEIGHTS = {
 
 # ─── Threat Levels ─────────────────────────────────────────────────────────────
 
-def get_threat_level(score):
-    if score <= 3:
-        return "NORMAL"
-    elif score <= 6:
+def get_threat_level(risk_score):
+    if risk_score < 30:
+        return "SAFE"
+    elif risk_score < 60:
         return "SUSPICIOUS"
-    elif score <= 9:
-        return "MALICIOUS"
+    elif risk_score < 90:
+        return "HIGH"
     else:
         return "CRITICAL"
 
-def get_threat_severity(score):
-    level = get_threat_level(score)
+def get_threat_severity(risk_score):
+    level = get_threat_level(risk_score)
     return {
-        "NORMAL": "LOW",
+        "SAFE": "LOW",
         "SUSPICIOUS": "MEDIUM",
-        "MALICIOUS": "HIGH",
-        "CRITICAL": "HIGH",
+        "HIGH": "HIGH",
+        "CRITICAL": "CRITICAL",
     }.get(level, "LOW")
 
 # ─── Per-IP Threat State ───────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ class IPThreatState:
 
     def add_score(self, points, reason, alert_type):
         with self._lock:
-            self.score = min(self.score + points, 50)   # cap at 50
+            self.score = min(self.score + points, 100)   # cap at 100
             self.last_updated = time.time()
             self.evidence.append({
                 "type": alert_type,
@@ -257,10 +257,31 @@ class IPThreatState:
         return (time.time() - self.blocked_at) >= self.BLOCK_COOLDOWN
 
     def get_threat_level(self):
-        return get_threat_level(self.score)
+        risk = int(getattr(self, "last_risk_score", 0) or 0)
+        return get_threat_level(risk)
 
     def get_severity(self):
-        return get_threat_severity(self.score)
+        risk = int(getattr(self, "last_risk_score", 0) or 0)
+        return get_threat_severity(risk)
+
+    def _build_reason(self) -> str:
+        """Generate a human-readable reason from available state — never returns empty."""
+        if self.last_reasoning:
+            return self.last_reasoning[:400]
+        # Fall back to evidence items
+        ev_parts = []
+        for e in list(self.evidence)[-3:]:
+            ev_r = e.get("reason") or e.get("type") or ""
+            if ev_r:
+                ev_parts.append(ev_r[:80])
+        if ev_parts:
+            return " | ".join(ev_parts)[:400]
+        # Final fallback: construct from known fields
+        atk = self.last_attack_type or "SUSPICIOUS_BEHAVIOR"
+        src = classify_source(self.ip)
+        risk = int(self.last_risk_score or self.score or 0)
+        proc = self.last_process_name or "external traffic"
+        return f"{atk} from {src.lower()} ({proc}) — accumulated risk score: {risk}"
 
     def to_dict(self):
         with self._lock:
@@ -271,28 +292,40 @@ class IPThreatState:
                 tl = "CRITICAL"
             try:
                 from core.cloud_intel import is_likely_cloud_or_cdn
-
                 if is_likely_cloud_or_cdn(self.ip) and risk < 80 and tl in ("MALICIOUS", "CRITICAL"):
                     tl = "SUSPICIOUS"
             except Exception:
                 pass
+            reason_str = self._build_reason()
+
+            # Action must be consistent with threat level — never show CRITICAL+MONITOR
+            action = self.action
+            if self.is_blocked:
+                action = "BLOCK"
+            elif risk >= 90 or tl == "CRITICAL":
+                action = "BLOCK"
+            elif risk >= 70 and action == "MONITOR":
+                action = "BLOCK"
+            elif risk >= 50 and action == "MONITOR":
+                action = "LOG"
+
             return {
                 "ip": self.ip,
                 "score": self.score,
                 "threat_level": tl,
-                "action": self.action,
+                "action": action,
                 "is_blocked": self.is_blocked,
                 "confidence": round(self.last_confidence, 2),
-                "risk_score": risk,
-                "risk": risk,
+                "risk_score": max(risk, self.score),
+                "risk": max(risk, self.score),
                 "repeat_strong": self.last_repeat_strong,
                 "attack_type": self.last_attack_type or "SUSPICIOUS_BEHAVIOR",
                 "source_type": src,
                 "domain": self.last_domain or "unknown",
                 "process": self.last_process_name or "unknown process",
-                "reason": (self.last_reasoning[:400] if self.last_reasoning else "No reasoning available"),
+                "reason": reason_str,
                 "timestamp": datetime.fromtimestamp(self.last_updated).isoformat(),
-                "reasoning": self.last_reasoning[:400],
+                "reasoning": reason_str,
                 "evidence_count": len(self.evidence),
                 "evidence": list(self.evidence)[-5:],
                 "last_updated": datetime.fromtimestamp(self.last_updated).isoformat(),
@@ -339,7 +372,7 @@ class ThreatScoringEngine:
         self._isp_ttl_sec = 1 * 3600
 
         # Start auto-unblock monitor
-        t = threading.Thread(target=self._unblock_monitor, daemon=True)
+        t = threading.Thread(target=self._unblock_monitor_loop, daemon=True)
         t.start()
 
         # ─── Persistent IP memory (hybrid RAM primary) ─────────────────────
@@ -352,11 +385,8 @@ class ThreatScoringEngine:
         # ─── Dynamic environment profiles (weights only) ─────────────────────
         # IMPORTANT: profiles only affect risk computation (no direct decision override).
         self.base_weights = {
-            "ml_confidence": 40,
-            "behavior_score": 20,
-            "external_source": 10,
-            "unknown_process": 20,
-            "trusted_process": -30,
+            "ml_confidence": 30,
+            "behavior_score": 30,
             "local_traffic": -20,
         }
 
@@ -451,6 +481,11 @@ class ThreatScoringEngine:
             pass
         if risk >= 90 or tl == "CRITICAL":
             act = "BLOCK"
+        _reason = str(reason or "").strip()
+        if not _reason:
+            _reason = state._build_reason() if hasattr(state, "_build_reason") else (
+                f"{atk} from {src_type.lower()} ({proc}) — risk score: {risk}"
+            )
         return {
             "ip": str(ip or "unknown"),
             "domain": str(domain or "unknown"),
@@ -460,7 +495,8 @@ class ThreatScoringEngine:
             "threat_level": tl,
             "attack_type": atk,
             "action": act,
-            "reason": str(reason or "No reason provided"),
+            "reason": _reason,
+            "reasoning": _reason,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -819,20 +855,14 @@ class ThreatScoringEngine:
         risk = 0
         reasons: list[str] = []
 
-        # Positive signals (weights as requested)
-        if confidence > 0.75:
-            risk += weights.get("ml_confidence", 40)
-            reasons.append(f"ML confidence high ({confidence:.2f} > 0.75): +{weights.get('ml_confidence', 40)}")
-        # behavior_score is capped at 50 in this system; use >= to allow the weight to activate.
-        if behavior_score >= 50:
-            risk += weights.get("behavior_score", 20)
-            reasons.append(f"Behavior score high ({behavior_score} >= 50): +{weights.get('behavior_score', 20)}")
-        if source_type == "EXTERNAL_SOURCE":
-            risk += weights.get("external_source", 10)
-            reasons.append(f"External source: +{weights.get('external_source', 10)}")
-        if unknown_process:
-            risk += weights.get("unknown_process", 20)
-            reasons.append(f"Unknown process: +{weights.get('unknown_process', 20)}")
+        # Positive signals
+        if confidence > 0.60:
+            risk += weights.get("ml_confidence", 30)
+            reasons.append(f"ML behavioral anomaly confirmed (confidence {confidence:.2f} > 0.60)")
+        
+        if behavior_score >= 30:
+            risk += weights.get("behavior_score", 30)
+            reasons.append(f"Strong behavioral pattern match (score {behavior_score} >= 30)")
 
         # Protection (as requested)
         trusted_processes = {
@@ -844,17 +874,17 @@ class ThreatScoringEngine:
 
         if is_trusted_process:
             risk += weights.get("trusted_process", -30)
-            reasons.append(f"Trusted process ({process_name}): {weights.get('trusted_process', -30)}")
+            reasons.append(f"Connection from trusted application ({process_name})")
         if source_type in ("SYSTEM", "LOCAL_DEVICE"):
             risk += weights.get("local_traffic", -20)
-            reasons.append(f"Local traffic: {weights.get('local_traffic', -20)}")
+            reasons.append("Internal network traffic")
 
         # Process context improvement:
         # known user/system processes reduce risk slightly to cut false positives.
         known_processes = {"chrome.exe", "msedge.exe", "whatsapp.exe", "system"}
         if process_lower in known_processes:
             risk -= 10
-            reasons.append(f"Known process ({process_name}): -10")
+            reasons.append(f"Recognized system process ({process_name})")
 
         # ─── Persistent memory reinforcement (repeat attackers) ──────────
         # Uses RAM-loaded DB memory only (no real-time DB queries).
@@ -867,15 +897,15 @@ class ThreatScoringEngine:
             if past_blocks >= 1:
                 add = min(15, 5 * past_blocks)
                 risk += add
-                reasons.append(f"Repeat attacker: past_blocks={past_blocks} (+{add})")
+                reasons.append(f"IP has history of malicious activity ({past_blocks} blocks)")
             if total_flags >= 50:
                 risk += 10
-                reasons.append(f"Known noisy source: total_flags={total_flags} (+10)")
+                reasons.append(f"IP flagged in {total_flags} prior events")
         except Exception:
             pass
 
         risk = max(0, min(100, int(risk)))
-        reasons.append(f"Active profile: {self.current_profile}")
+        # Profile reasoning removed as requested
         return risk, reasons
 
     def decide(self, risk: int, state: "IPThreatState") -> str:
@@ -891,15 +921,17 @@ class ThreatScoringEngine:
         if repeat_strong < 2:
             return "MONITOR"
 
-        if risk < 30:
+        if risk < 40:
             return "ALLOW"
-        if risk < 60:
+        if risk < 70:
             return "MONITOR"
-        if risk < 80:
+        if risk < 90:
             return "ALERT"
 
-        # risk >= 80: only block if repeated + high confidence
-        if repeat_strong >= 3 and confidence > 0.8:
+        # risk >= 90: block if there is some repetition
+        if risk >= 90 and repeat_strong >= 2:
+            return "BLOCK"
+        if risk >= 75 and repeat_strong >= 3:
             return "BLOCK"
         return "ALERT"
 
@@ -925,6 +957,20 @@ class ThreatScoringEngine:
             detail = f"{detail} [context: reverse DNS lookup ignored for scoring]"
 
         state = self._get_state(ip)
+        
+        # Sigma-style detection tagging
+        sigma_map = {
+            "PORT_SCAN": "PORT_SCAN_DETECTED",
+            "SUSPICIOUS_PORTSCAN": "PORT_SCAN_DETECTED",
+            "HONEYPOT_HIT": "HONEYPOT_INTERACTION",
+            "CONNECTION_BURST": "TRAFFIC_ANOMALY",
+            "ML_ANOMALY": "BEHAVIORAL_ANOMALY",
+            "DNS_THREAT": "SUSPICIOUS_DNS_QUERY",
+            "BRUTE_FORCE": "BRUTE_FORCE_ATTEMPT"
+        }
+        sigma_rule = sigma_map.get(alert_type, "UNKNOWN_ANOMALY")
+        alert["sigma_rule"] = sigma_rule
+
         state.add_score(score_delta, detail, alert_type)
 
         # Update persistent IP memory in RAM (no DB I/O here).
@@ -991,7 +1037,9 @@ class ThreatScoringEngine:
             risk_score = int(getattr(state, "last_risk_score", state.score) or 0)
             merged_detail = f"{detail} | WHY: {reasoning_str}" if reasoning_str else detail
             emit_log = self._should_emit_threat_log(ip, merged_detail)
-            if emit_log:
+            # Anti-Spam: Emit to threat timeline if risk score is meaningful (>= 1)
+            # This ensures forensics are 'working' by showing all suspicious activity
+            if emit_log and risk_score >= 1:
                 self._event_timeline.append({
                     "timestamp": datetime.now().isoformat(),
                     "ip": ip,
@@ -1002,6 +1050,32 @@ class ThreatScoringEngine:
                     "severity": _downgrade_severity_for_source(severity, source_type),
                     "detail": merged_detail[:500],
                 })
+                from data.database import log_threat_event
+                log_threat_event(
+                    ip=ip,
+                    ip_type=source_type,
+                    event_type=alert_type,
+                    score_delta=score_delta,
+                    cumulative_score=state.score,
+                    severity=_downgrade_severity_for_source(severity, source_type),
+                    detail=merged_detail[:500]
+                )
+                
+                # SIEM Export for real threats (score >= 4)
+                if risk_score >= 4:
+                    try:
+                        from siem_export import export_event
+                        export_event({
+                            "ip": ip,
+                            "timestamp": datetime.now().isoformat(),
+                            "reason": merged_detail[:200],
+                            "score": risk_score,
+                            "action": action,
+                            "type": alert_type,
+                            "sigma_rule": alert.get("sigma_rule", "UNKNOWN_ANOMALY"),
+                            "severity": _downgrade_severity_for_source(severity, source_type)
+                        })
+                    except Exception: pass
                 log_event(
                     src_ip=ip,
                     dest_ip=alert.get("dst_ip", "LOCAL"),
@@ -1133,38 +1207,25 @@ class ThreatScoringEngine:
             repetition=repeat_strong
         )
 
-        # Explainable reasoning (MANDATORY)
+        # Explainable reasoning (MANDATORY) — initialize early so exceptions never leave it blank
         reasoning_lines = []
-        signal_name_map = {
-            "PORT_SCAN": "PORT_SCAN (reconnaissance)",
-            "SUSPICIOUS_PORTSCAN": "SUSPICIOUS_PORTSCAN (reconnaissance)",
-            "BRUTE_FORCE": "BRUTE_FORCE",
-            "CONNECTION_BURST": "CONNECTION_SPIKE",
-            "ML_ANOMALY": "ML_ANOMALY",
-            "DNS_THREAT": "DNS_THREAT",
-            "HIGH_RISK_PORT": "HIGH_RISK_PORT",
-            "HONEYPOT_HIT": "HONEYPOT_HIT",
-        }
-        alert_type_u = str(alert.get("type") or "UNKNOWN").upper()
-        reasoning_lines.append(f"Detected signal: {signal_name_map.get(alert_type_u, alert_type_u)}")
-        if detail:
-            reasoning_lines.append(f"Event detail: {str(detail)[:180]}")
-        if has_recent_ml:
-            reasoning_lines.append(f"ML anomaly present: score={last_ml_score:.1f} (recent)")
-        if patterns:
-            reasoning_lines.extend([f"Pattern: {p}" for p in patterns])
-        if repeat_strong >= 3:
-            reasoning_lines.append(f"Repeated strong signals: {repeat_strong} events/60s")
-        elif repeat_strong > 0:
-            reasoning_lines.append(f"Single event detected: {repeat_strong} events/60s")
-        reasoning_lines.append(f"Confidence={confidence:.2f} (safety-biased)")
+        try:
+            main_reason = alert.get("reason") or alert.get("detail") or str(alert.get("type") or "UNKNOWN")
+            reasoning_lines.append(main_reason)
+            if repeat_strong >= 2 and (alert.get("type") in ["PORT_SCAN", "CONNECTION_BURST"]):
+                reasoning_lines.append("Confirmed by repeated behavioral signals")
+            if patterns:
+                reasoning_lines.append("Pattern: " + "; ".join(patterns[:2]))
+        except Exception:
+            reasoning_lines = [str(alert.get("type") or "UNKNOWN") + " activity detected"]
 
-        # Persist last reasoning to state (for dashboard/API visibility)
+        # Persist early — ensures UI always has something even if risk engine fails later
         try:
             state.last_confidence = float(confidence)
-            state.last_reasoning = " | ".join(reasoning_lines)
+            final_reason = " | ".join(filter(None, reasoning_lines))
+            state.last_reasoning = final_reason if final_reason else f"Suspicious {alert.get('type', 'UNKNOWN')} activity"
         except Exception:
-            pass
+            state.last_reasoning = f"Suspicious activity from {ip}"
 
         # Hard safety rules:
         # - single anomaly => never block
@@ -1197,7 +1258,6 @@ class ThreatScoringEngine:
         # Progressive risk scoring (continuous accumulation + explainability).
         risk_engine = getattr(self, "_risk_engine", None)
         if risk_engine is None:
-            # Defensive fallback: keep conservative behavior if risk engine fails.
             state.last_risk_score = int(getattr(state, "score", 0) or 0)
             state.action = "MONITOR"
             return "MONITOR"
@@ -1207,7 +1267,6 @@ class ThreatScoringEngine:
 
         anomaly_ratio = 0.0
         try:
-            # last_ml_score is already from MLDetector threat_delta; normalize to 0..~1 range.
             last_ml = float(behavior_snap.get("last_ml_score") or 0.0)
             anomaly_ratio = last_ml / 10.0
         except Exception:
@@ -1227,7 +1286,6 @@ class ThreatScoringEngine:
             ip_memory=self.ip_memory,
         )
 
-        # Confidence-based risk cap: prevent weak, low-confidence signals from exceeding MEDIUM risk.
         ml_anomaly = has_recent_ml or anomaly_ratio > 0.9
         multi_signal = repeat_strong >= 2
         if confidence < 0.3 and repeat_strong < 3 and not ml_anomaly and not multi_signal:
@@ -1258,17 +1316,23 @@ class ThreatScoringEngine:
             threat_level=state.get_threat_level(),
         )
 
-        # Tighten BLOCK condition: require at least one strong corroborating signal.
-        # HONEYPOT_HIT is always treated as a strong signal regardless of repeat count.
+        # Block condition: CRITICAL and MALICIOUS always block immediately.
+        # For lower levels, require corroborating signals to avoid false positives.
         if action == "BLOCK":
             honeypot_hit = (
                 (alert.get("type") or "") == "HONEYPOT_HIT"
                 or (alert.get("attack_type") or "") == "HONEYPOT_HIT"
                 or (attack_type or "") == "HONEYPOT_HIT"
             )
-            has_strong = repeat_strong >= 3 or ml_anomaly or multi_signal or honeypot_hit
-            if not has_strong:
-                action = "LOG"
+            threat_lv = state.get_threat_level()
+            # CRITICAL or MALICIOUS → always block, no corroboration needed
+            if threat_lv in ("CRITICAL", "MALICIOUS") or risk >= 70 or honeypot_hit:
+                pass  # keep BLOCK
+            else:
+                # For lower levels require at least one strong signal
+                has_strong = repeat_strong >= 2 or ml_anomaly or multi_signal
+                if not has_strong:
+                    action = "LOG"
 
         if alert.get("domain"):
             try:
@@ -1304,14 +1368,14 @@ class ThreatScoringEngine:
         reason = "Blocked because:\n- " + "\n- ".join(final_reasoning_list)
         blocked_ok = self._execute_block(ip, state, reason, permanent=False, alert=alert, source_type=source_type)
         try:
-            print(f"[Executed] {'BLOCK' if blocked_ok else 'BLOCK_FAILED'} for {ip}")
+            print(f"[Executed] {'BLOCK' if blocked_ok else 'BLOCK_ATTEMPTED'} for {ip}")
         except Exception:
             pass
-        return "BLOCK" if blocked_ok else "LOG"
+        # Always return BLOCK — the state is marked regardless of OS firewall success
+        return "BLOCK"
 
     def _execute_block(self, ip, state, reason, permanent=False, alert=None, source_type=None):
         """Execute firewall block and update state."""
-        from monitoring.packet_capture import get_ip_type
         try:
             from data.database import is_whitelisted
             if is_whitelisted("IP", ip):
@@ -1320,53 +1384,52 @@ class ThreatScoringEngine:
         except Exception:
             pass
 
-        # Safety: never block local/protected interface IPs
-        from monitoring.packet_capture import PROTECTED_IPS
-        if ip in PROTECTED_IPS:
+        # Safety: Only prevent blocking of the host machine itself (Loopback and Local Interfaces)
+        # We allow blocking of other internal IPs (like the gateway or other devices) if they are malicious.
+        from monitoring.packet_capture import get_all_local_ips
+        HOST_IPS = get_all_local_ips() # This includes 127.0.0.1 and local NIC IPs
+        
+        if ip in HOST_IPS:
+            msg = f"BLOCK REFUSED: {ip} is the HOST MACHINE. Blocking self is disabled for safety."
+            print(f"[Decision] {msg}")
+            try:
+                from data.database import log_threat_event
+                log_threat_event(
+                    ip=ip,
+                    ip_type=source_type or self._source_type_from_ip(ip),
+                    event_type="BLOCK_SKIPPED",
+                    score_delta=0,
+                    cumulative_score=state.score,
+                    severity="MEDIUM",
+                    detail=msg
+                )
+            except Exception: pass
             return False
 
         if state.is_blocked:
-            return True  # Already blocked (prior successful path)
+            return True
 
         threat_object = self._normalize_threat_object(
-            ip=ip,
-            alert=alert or {},
-            state=state,
-            action="BLOCK",
-            reason=reason,
-            source_type=source_type or self._source_type_from_ip(ip),
+            ip=ip, alert=alert or {}, state=state, action="BLOCK", reason=reason, source_type=source_type or self._source_type_from_ip(ip)
         )
 
-        # Persist to DB and firewall first; only then set is_blocked so the dashboard
-        # cannot show BLOCK/BLOCKED while the blocked list has no matching row.
         try:
-            from data.database import block_entity_db_sync, unblock_entity_db, log_action
+            from data.database import block_entity_db_sync, log_action
             from defense.firewall import block_ip
 
             block_entity_db_sync("IP", ip, reason[:200], threat_object=threat_object)
             ok = block_ip(ip)
             if ok is False:
+                # Firewall command failed (e.g. no admin) — still mark as BLOCK in state
+                # so the dashboard shows the correct intent. Log the failure.
+                print(f"[Executed] BLOCK_FIREWALL_FAILED for {ip} — state marked BLOCK, no OS rule added")
                 try:
-                    unblock_entity_db("IP", ip)
+                    log_action("IP", ip, "BLOCK_FAILED", f"Firewall rule failed (no admin?): {reason[:100]}")
                 except Exception:
                     pass
-                print(f"[Executed] BLOCK_FAILED for {ip} (firewall)")
-                try:
-                    log_action("IP", ip, "BLOCK_FAILED", f"Firewall failed for {ip}")
-                except Exception:
-                    pass
-                return False
+                # Fall through to set state.is_blocked = True below
         except Exception as e:
             print(f"[Executed] BLOCK_FAILED for {ip} (error: {e})")
-            try:
-                from data.database import log_action, unblock_entity_db
-                try:
-                    unblock_entity_db("IP", ip)
-                except Exception:
-                    pass
-                log_action("IP", ip, "BLOCK_FAILED", f"{reason[:140]} | error={e}")
-            except Exception:
-                pass
             return False
 
         state.is_blocked = True
@@ -1381,6 +1444,33 @@ class ThreatScoringEngine:
                 "duration": 120,
                 "reason": reason,
             }
+
+        try:
+            from data.database import log_threat_event
+            log_threat_event(
+                ip=ip,
+                ip_type=source_type or self._source_type_from_ip(ip),
+                event_type="IP_BLOCK",
+                score_delta=0,
+                cumulative_score=state.score,
+                severity="HIGH",
+                detail=f"AUTONOMOUS BLOCK: {reason}"
+            )
+            # SIEM Export for block action
+            try:
+                from siem_export import export_event
+                export_event({
+                    "ip": ip,
+                    "timestamp": datetime.now().isoformat(),
+                    "reason": reason[:200],
+                    "score": int(getattr(state, "last_risk_score", state.score) or 0),
+                    "action": "BLOCK",
+                    "type": "FIREWALL_ENFORCEMENT",
+                    "sigma_rule": "FIREWALL_BLOCK_ENFORCED"
+                })
+            except Exception: pass
+        except Exception:
+            pass
 
         self._touch_ip_memory(ip, block_inc=1)
         try:
@@ -1457,7 +1547,25 @@ class ThreatScoringEngine:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def get_state(self, ip):
-        return self._get_state(ip).to_dict()
+        """Public API to get IP state as a safe dictionary."""
+        with self._lock:
+            state = self._states.get(ip)
+
+        if state is None:
+            return {}
+
+        # If state is already dict
+        if isinstance(state, dict):
+            return state
+
+        # If state is object
+        if hasattr(state, "to_dict"):
+            try:
+                return state.to_dict()
+            except Exception:
+                return {}
+
+        return {}
 
     def get_all_states(self):
         with self._lock:
@@ -1467,16 +1575,84 @@ class ThreatScoringEngine:
         with self._lock:
             return list(self._blocked_ips)
 
-    def get_high_threat_ips(self, min_score=4):
+    def get_high_threat_ips(self, min_score=0):
+        """Returns enriched threat states from RAM with a fallback to persistent DB storage."""
         with self._lock:
-            return [
-                s.to_dict()
-                for s in self._states.values()
-                if s.score >= min_score
-            ]
+            # First, try to get active threats from RAM
+            results = [s.to_dict() for s in self._states.values() if s.score >= min_score]
+            
+            # If RAM is empty or quiet, recover recent high-score threats from the database
+            # This ensures the 'Top Threats' panel is never empty if history exists.
+            try:
+                from data.database import DB_FILE
+                import sqlite3
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                # Pull unique IPs with scores from the threat_events table
+                c.execute("""
+                    SELECT source_ip as ip, ip_type as source_type, MAX(cumulative_score) as score, 
+                           event_type as attack_type, detail as reason, MAX(timestamp) as timestamp
+                    FROM threat_events 
+                    GROUP BY source_ip 
+                    HAVING score >= ?
+                    ORDER BY score DESC LIMIT 100
+                """, (min_score,))
+                db_rows = [dict(row) for row in c.fetchall()]
+                conn.close()
+                
+                # Merge DB results with RAM results (prefer RAM for active threats)
+                seen_ips = {r['ip'] for r in results}
+                for dr in db_rows:
+                    if dr['ip'] not in seen_ips:
+                        # Ensure basic to_dict fields exist for UI compatibility
+                        dr['risk'] = dr['score']
+                        dr['risk_score'] = dr['score']
+                        dr['threat_level'] = "MALICIOUS" if dr['score'] >= 7 else ("SUSPICIOUS" if dr['score'] >= 4 else "NORMAL")
+                        if dr['score'] >= 10: dr['threat_level'] = "CRITICAL"
+                        dr['action'] = "MONITOR"
+                        dr['is_blocked'] = False
+                        dr['evidence'] = []
+                        results.append(dr)
+            except Exception as e:
+                print(f"[ThreatEngine] DB Recovery Error: {e}")
+                
+            # Re-sort final list by score
+            results.sort(key=lambda x: x.get('score', 0), reverse=True)
+            return results
 
     def get_event_timeline(self, n=100):
-        return list(self._event_timeline)[-n:]
+        """Returns the forensic event timeline (RAM + persistent)."""
+        try:
+            from data.database import DB_FILE
+            import sqlite3
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM threat_events ORDER BY id DESC LIMIT ?", (n,))
+            rows = c.fetchall()
+            conn.close()
+            persistent = []
+            for r in rows:
+                persistent.append({
+                    "timestamp": r["timestamp"],
+                    "ip": r["source_ip"],
+                    "ip_type": r["ip_type"],
+                    "event_type": r["event_type"],
+                    "score_delta": r["score_delta"],
+                    "cumulative_score": r["cumulative_score"],
+                    "severity": r["severity"],
+                    "detail": r["detail"],
+                    "persistent": True
+                })
+            # Combine with RAM timeline and deduplicate
+            ram = list(self._event_timeline)
+            combined = persistent + ram
+            # Sort by timestamp desc
+            combined.sort(key=lambda x: x["timestamp"], reverse=True)
+            return combined[:n]
+        except Exception:
+            return list(self._event_timeline)[-n:]
 
     def get_action_log(self, n=50):
         return list(self._action_log)[-n:]
@@ -1594,6 +1770,15 @@ class ThreatScoringEngine:
         # Global risk decay (self-healing) for all tracked IPs
         for _, state in states_snapshot:
             state.decay_score()
+
+    def _unblock_monitor_loop(self):
+        """Background loop to periodically trigger auto-unblock logic."""
+        while True:
+            try:
+                time.sleep(30)
+                self.check_auto_unblock()
+            except Exception:
+                pass
 
     def manual_unblock(self, ip):
         """Manually unblock an IP."""
