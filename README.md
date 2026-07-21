@@ -124,7 +124,7 @@ Real-time attack visualization
 Cloud deployment
 
 👥 Team
-Sarthak Mhatre – CTO / Lead Security Engineer
+Sarthak Mhatre – Founder / CTO
 
 Diksha Churi – Co-Founder / Full Stack Developer
 
