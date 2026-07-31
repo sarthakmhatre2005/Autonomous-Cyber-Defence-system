@@ -1,6 +1,11 @@
 🚨 Autonomous Cyber Defense Platform
 An intelligent, real-time cybersecurity system that monitors network traffic, detects anomalies using machine learning, and automatically responds to threats without human intervention.
 
+👥 Team
+Sarthak Mhatre – Founder / CTO
+
+Diksha Churi – Co-Founder / Full Stack Developer
+
 🔍 Overview
 The Autonomous Cyber Defense Platform is designed to protect networks from modern cyber threats such as:
 
@@ -122,15 +127,6 @@ Advanced attack classification
 Real-time attack visualization
 
 Cloud deployment
-
-👥 Team
-Sarthak Mhatre – Founder / CTO
-
-Diksha Churi – Co-Founder / Full Stack Developer
-
-Diya – Business & Strategy
-
-Ankita – Product Support
 
 ⚡ Vision
 To build an autonomous security layer that continuously monitors, detects, and defends networks against cyber threats in real time.
