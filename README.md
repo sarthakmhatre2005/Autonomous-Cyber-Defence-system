@@ -2,6 +2,7 @@
 An intelligent, real-time cybersecurity system that monitors network traffic, detects anomalies using machine learning, and automatically responds to threats without human intervention.
 
 👥 Team
+
 Sarthak Mhatre – Founder / CTO
 
 Diksha Churi – Co-Founder / Full Stack Developer
